@@ -4,6 +4,8 @@
 
 Design a scalable Video-on-Demand platform similar to YouTube, Netflix, or Amazon Prime Video.
 
+> **Cloud mapping convention:** AWS services from the lecture are preserved exactly. Where applicable, the closest Azure component is added in brackets so the same design can be explained in either cloud.
+
 The session focuses on four user-facing features:
 
 1. Upload video
@@ -49,22 +51,25 @@ This prevents the interview from becoming too broad and gives the interviewer a 
 ```text
                          +----------------------+
                          |  Static Web Frontend |
-                         |        S3            |
+                         | S3 [Azure Blob Storage] |
                          +----------+-----------+
                                     |
                                     v
-                                  CDN
+                                  CDN [Azure Front Door]
                                     |
                        +------------+------------+
                        |                         |
                        v                         v
                  API Gateway                Video Content
+              [Azure API Management]
                        |                         |
                        v                         v
-                    Lambda                     S3
+                    Lambda [Azure Functions]                     S3
+              [Azure Functions]          [Azure Blob Storage]
                        |                         ^
                        v                         |
-                 Elasticsearch /                |
+                 Elasticsearch [Azure AI Search] /                |
+          [Azure AI Search]                    |
                  Search Index                   |
                                                  |
 User Upload                                      |
@@ -75,13 +80,13 @@ Original 4K MP4                                  |
    v                                             |
    S3 -------------------------------------------+
    |
-   +--> Step Functions
+   +--> Step Functions [Azure Durable Functions / Logic Apps]
            |
-           +--> MediaConvert --> 720p / 960p / 1080p / ...
+           +--> MediaConvert [Azure Batch/AKS + FFmpeg] [Azure Batch/AKS + FFmpeg] --> 720p / 960p / 1080p / ...
            |
-           +--> Rekognition --> moderation result
+           +--> Rekognition [Azure AI Content Safety] [Azure AI Content Safety via frame extraction] --> moderation result
            |
-           +--> Metadata indexing --> Elasticsearch
+           +--> Metadata indexing --> Elasticsearch [Azure AI Search]
 ```
 
 ---
@@ -100,11 +105,11 @@ The video file and the metadata should not necessarily be stored in the same sys
 
 ---
 
-## Video Storage — Amazon S3
+## Video Storage — Amazon S3 [Azure Blob Storage]
 
-The instructor chooses **Amazon S3** for video/object storage.
+The instructor chooses **Amazon S3** [**Azure Blob Storage**] for video/object storage.
 
-### Why S3?
+### Why S3? [Azure: Why Blob Storage?]
 
 The requirements are:
 
@@ -132,13 +137,13 @@ Original Video
    |
    v
 +------+
-|  S3  |
+|  S3  |  [Azure Blob Storage]
 +------+
 ```
 
 ### Interview point
 
-For very large media objects, think **object storage**, not a relational database or local disk.
+For very large media objects, think **object storage**, not a relational database or local disk. On Azure, the equivalent object store is **Azure Blob Storage**.
 
 ---
 
@@ -153,7 +158,7 @@ Video metadata includes:
 - Locations / object keys for encoded versions
 - Moderation / explicit-content status
 
-The session uses **Elasticsearch** because the metadata needs text-search capability.
+The session uses **Elasticsearch** [**Azure AI Search** for the Azure-native equivalent] because the metadata needs text-search capability.
 
 ```text
 Title
@@ -162,7 +167,7 @@ Tags
    |
    v
 +----------------+
-| Elasticsearch  |
+| Elasticsearch  |  [Azure AI Search]
 +----------------+
 ```
 
@@ -196,7 +201,7 @@ So the uploaded video is processed **ahead of time**.
              Original 4K
                  |
                  v
-          MediaConvert
+          MediaConvert [Azure Batch/AKS + FFmpeg]
         /      |       \
        v       v        v
     720p     960p     1080p
@@ -206,17 +211,19 @@ So the uploaded video is processed **ahead of time**.
 
 The AWS service used in the session is:
 
-**AWS Elemental MediaConvert**
+**AWS Elemental MediaConvert** [**Azure: Azure Batch or AKS/VM Scale Sets running FFmpeg or a media-transcoding solution**]
 
-The generated renditions are stored back in S3.
+The generated renditions are stored back in S3 [Azure Blob Storage].
 
 Their object locations can be associated with the video metadata/search record.
+
+> **Azure note:** Azure Media Services was retired, so for a current Azure design use a transcoding pipeline such as **FFmpeg workers on Azure Batch, AKS, or VM Scale Sets**, rather than proposing Azure Media Services.
 
 ---
 
 # 5. Explicit-Content Detection
 
-The session uses **Amazon Rekognition** for content moderation.
+The session uses **Amazon Rekognition [Azure AI Content Safety]** [**Azure AI Content Safety**, typically by sampling/extracting video frames; Azure AI Video Indexer can complement the workflow] for content moderation.
 
 Conceptually:
 
@@ -249,20 +256,22 @@ After the original file is uploaded, several jobs can happen independently:
 - Run content moderation
 - Index metadata
 
-The session uses **AWS Step Functions** as a workflow/orchestration engine.
+The session uses **AWS Step Functions** [**Azure Durable Functions** or **Azure Logic Apps**] as a workflow/orchestration engine.
 
 ```text
-                    S3 Upload
+                    S3 Upload [Azure Blob Storage]
                        |
                        v
                     Lambda
                        |
                        v
-                Step Functions
+                Step Functions [Azure Durable Functions]
           _________|___________
          |         |           |
          v         v           v
     MediaConvert  Rekognition  Metadata
+ [Azure Batch/     [Azure AI
+  AKS + FFmpeg]     Content Safety]
       jobs        moderation   indexing
 ```
 
@@ -290,23 +299,23 @@ Static Website
 CDN
  |
  v
-API Gateway
+API Gateway [Azure API Management]
  |
  v
-Lambda
+Lambda [Azure Functions]
  |
  v
-Elasticsearch
+Elasticsearch [Azure AI Search]
 ```
 
-The static frontend can itself be hosted from S3 and distributed through a CDN.
+The static frontend can itself be hosted from S3 [Azure Blob Storage static website or Azure Static Web Apps] and distributed through a CDN [Azure Front Door].
 
 For dynamic search requests:
 
 1. User enters a search term.
-2. Request reaches API Gateway.
-3. API Gateway invokes backend logic, represented by Lambda.
-4. Lambda queries Elasticsearch.
+2. Request reaches API Gateway [Azure API Management].
+3. API Gateway invokes backend logic, represented by Lambda [Azure Functions].
+4. Lambda queries Elasticsearch [Azure AI Search].
 5. Matching video metadata is returned.
 6. The result may be cached closer to users where appropriate.
 
@@ -318,16 +327,16 @@ The source video may be stored in one AWS region, for example Northern Virginia.
 
 It is inefficient for every user worldwide to retrieve the same video directly from the origin S3 bucket.
 
-A **Content Delivery Network (CDN)** is placed in front of the media origin.
+A **Content Delivery Network (CDN)** [**Azure Front Door** / Azure CDN-style edge delivery] is placed in front of the media origin.
 
 ```text
                  +----------------+
-                 | Origin S3      |
+                 | Origin S3      |  [Azure Blob Storage]
                  | US Region      |
                  +-------+--------+
                          |
                          v
-                      CDN
+                      CDN [Azure Front Door]
              _________|__________
             |         |          |
             v         v          v
@@ -340,7 +349,7 @@ A **Content Delivery Network (CDN)** is placed in front of the media origin.
 If a video is not present at the edge:
 
 ```text
-Viewer --> CDN Edge --> Origin S3
+Viewer --> CDN Edge [Azure Front Door edge] --> Origin S3 [Azure Blob Storage]
 ```
 
 The CDN fetches it from origin and can cache it.
@@ -348,7 +357,7 @@ The CDN fetches it from origin and can cache it.
 ### Subsequent nearby requests
 
 ```text
-Viewer --> CDN Edge --> Cached Video
+Viewer --> CDN Edge [Azure Front Door edge] --> Cached Video
 ```
 
 Benefits:
@@ -396,19 +405,19 @@ The whiteboard separates the system into three major delivery paths:
 ### Static website
 
 ```text
-S3 --> CDN --> Browser
+S3 [Azure Blob Storage] --> CDN [Azure Front Door] --> Browser
 ```
 
 ### Dynamic API / search
 
 ```text
-Browser --> CDN/API entry --> API Gateway --> Lambda --> Search Index
+Browser --> CDN/API entry [Azure Front Door] --> API Gateway [Azure API Management] --> Lambda [Azure Functions] --> Search Index [Azure AI Search]
 ```
 
 ### Video playback
 
 ```text
-Browser / Player --> CDN --> Video Origin in S3
+Browser / Player --> CDN [Azure Front Door] --> Video Origin in S3 [Azure Blob Storage]
 ```
 
 This separation is an important architecture pattern.
@@ -417,13 +426,13 @@ The website, APIs, and large media content do not need to be served by the same 
 
 ---
 
-# 11. Cost Optimization with S3 Storage Classes
+# 11. Cost Optimization with S3 Storage Classes [Azure Blob Access Tiers]
 
 One of the stated design goals is **cost effectiveness**.
 
 Not every uploaded video remains popular.
 
-The session suggests moving older / less frequently accessed content to cheaper S3 storage classes using lifecycle policies.
+The session suggests moving older / less frequently accessed content to cheaper S3 storage classes using lifecycle policies. [Azure equivalent: **Blob Storage lifecycle management** with **Hot / Cool / Cold / Archive** access tiers.]
 
 Conceptual policy:
 
@@ -431,24 +440,24 @@ Conceptual policy:
 Frequently accessed
       |
       v
-S3 Standard
+S3 Standard [Azure Blob Hot tier]
       |
       | low access after N days
       v
-S3 Infrequent Access
+S3 Infrequent Access [Azure Blob Cool/Cold tier]
       |
       | very low access after more time
       v
-Archive / Glacier class
+Archive / Glacier class [Azure Blob Archive tier]
 ```
 
 The exact thresholds are business decisions.
 
 Example:
 
-- New / popular video -> S3 Standard
-- Older low-view video -> infrequent-access storage
-- Rarely accessed archive -> archival storage
+- New / popular video -> S3 Standard [Azure Blob Hot]
+- Older low-view video -> infrequent-access storage [Azure Blob Cool/Cold]
+- Rarely accessed archive -> archival storage [Azure Blob Archive]
 
 ### Key design principle
 
@@ -476,8 +485,8 @@ Examples mentioned:
 
 - Login / password
 - Identity provider integration
-- Amazon Cognito
-- Active Directory
+- Amazon Cognito [Azure: Microsoft Entra External ID]
+- Active Directory [Azure: Microsoft Entra ID / AD DS as appropriate]
 
 The system should decide:
 
@@ -489,7 +498,7 @@ The system should decide:
 
 ## Encryption at Rest
 
-The session mentions encrypting services such as S3 and Elasticsearch using **AWS KMS-managed encryption keys**.
+The session mentions encrypting services such as S3 and Elasticsearch using **AWS KMS-managed encryption keys** [Azure: **Azure Key Vault / Managed HSM** with platform or customer-managed keys for Azure Blob Storage and Azure AI Search].
 
 ---
 
@@ -505,7 +514,7 @@ Client
   |
  HTTPS/TLS
   v
-CDN / API Gateway
+CDN / API Gateway [Azure Front Door / Azure API Management]
   |
  TLS
   v
@@ -525,9 +534,9 @@ User
 Upload original video + metadata
  |
  v
-S3
+S3 [Azure Blob Storage]
  |
- +--> Step Functions
+ +--> Step Functions [Azure Durable Functions / Logic Apps]
         |
         +--> MediaConvert
         |      |
@@ -549,16 +558,16 @@ S3
 User
  |
  v
-CDN / Website
+CDN / Website [Azure Front Door / Azure Static Web Apps]
  |
  v
-API Gateway
+API Gateway [Azure API Management]
  |
  v
-Lambda
+Lambda [Azure Functions]
  |
  v
-Elasticsearch
+Elasticsearch [Azure AI Search]
  |
  v
 Matching video IDs / metadata
@@ -574,7 +583,7 @@ User selects video
        |
        +--> Cache HIT --> Stream HLS segments
        |
-       +--> Cache MISS --> S3 origin
+       +--> Cache MISS --> S3 origin [Azure Blob Storage]
                            |
                            v
                        CDN caches
@@ -666,7 +675,7 @@ Primary Metadata DB
         |
         v
 Search Index
-Elasticsearch / OpenSearch
+Elasticsearch / OpenSearch [Azure AI Search] [Azure AI Search]
 ```
 
 For interview purposes, say:
@@ -720,3 +729,109 @@ The most important ideas from this session are:
 8. Use **lifecycle/storage-tiering** to reduce cost.
 9. Cover both **authentication/authorization** and **encryption**.
 10. In an interview, always explain **why** each component exists, not just name AWS services.
+
+
+---
+
+# 18. AWS-to-Azure Component Mapping for the Same Design
+
+Use this as a quick interview translation layer. The architecture stays the same; only the managed-service choices change.
+
+| Architecture capability | AWS component used in this session | Azure equivalent / recommended current option |
+|---|---|---|
+| Object storage for original and encoded video | Amazon S3 | Azure Blob Storage |
+| Static website hosting | S3 static website | Azure Storage static website or Azure Static Web Apps |
+| CDN / global edge delivery | CDN / CloudFront-style layer | Azure Front Door |
+| API gateway | Amazon API Gateway | Azure API Management |
+| Serverless compute | AWS Lambda | Azure Functions |
+| Workflow orchestration | AWS Step Functions | Azure Durable Functions or Azure Logic Apps |
+| Video transcoding | AWS Elemental MediaConvert | Azure Batch, AKS, or VM Scale Sets running FFmpeg / media-processing workers |
+| Explicit-content moderation | Amazon Rekognition | Azure AI Content Safety, usually with extracted video frames; Azure AI Video Indexer can supplement analysis |
+| Full-text video metadata search | Elasticsearch / OpenSearch | Azure AI Search |
+| Consumer identity | Amazon Cognito | Microsoft Entra External ID |
+| Enterprise identity | Active Directory / federated identity | Microsoft Entra ID |
+| Key management | AWS KMS | Azure Key Vault / Managed HSM |
+| Hot object tier | S3 Standard | Azure Blob Hot |
+| Infrequent-access tier | S3 Standard-IA-style tier | Azure Blob Cool / Cold |
+| Archive tier | S3 Glacier-family tier | Azure Blob Archive |
+
+## Same Design Expressed in Azure
+
+```text
+User Upload
+   |
+   v
+Azure Blob Storage
+   |
+   v
+Azure Function
+   |
+   v
+Azure Durable Functions
+   |
+   +--> Azure Batch / AKS + FFmpeg
+   |        |
+   |        +--> 480p / 720p / 1080p / 4K renditions
+   |                 |
+   |                 v
+   |            Azure Blob Storage
+   |
+   +--> Frame extraction
+   |        |
+   |        v
+   |   Azure AI Content Safety
+   |
+   +--> Metadata indexing
+            |
+            v
+       Azure AI Search
+
+Playback path:
+
+Viewer
+   |
+   v
+Azure Front Door
+   |
+   +--> Cache HIT --> HLS/DASH segments
+   |
+   +--> Cache MISS --> Azure Blob Storage
+
+Search/API path:
+
+Client
+   |
+   v
+Azure Front Door
+   |
+   v
+Azure API Management
+   |
+   v
+Azure Functions
+   |
+   v
+Azure AI Search
+```
+
+### Interview takeaway
+
+Do not memorize the cloud-product names as the architecture. Memorize the **capabilities**:
+
+```text
+Object Storage
+     |
+Workflow / Async Processing
+     |
+Transcoding + Moderation
+     |
+Search Index
+     |
+CDN / Edge Delivery
+     |
+API Layer
+     |
+Identity + Encryption
+```
+
+Then map those capabilities to AWS, Azure, or another cloud depending on the interview context.
