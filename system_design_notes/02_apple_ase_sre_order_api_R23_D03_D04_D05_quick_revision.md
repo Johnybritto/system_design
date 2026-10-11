@@ -80,6 +80,9 @@ flowchart TD
 
 ### Diagram 2 — Overload path and protection
 
+<img width="2124" height="2274" alt="image" src="https://github.com/user-attachments/assets/b4dd7233-161f-4254-bdac-cce69f859438" />
+
+
 ```mermaid
 flowchart TD
     U["Client: retry budget, jitter"]
