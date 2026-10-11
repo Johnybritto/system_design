@@ -1,8 +1,10 @@
 # Apple ASE SRE — Order API Quick Revision (R23-D03 / D04 / D05)
 
-> **Purpose:** One-page-style interview revision for the **same Order API** across high availability, overload, and regional disaster recovery. Read each **diagram → concept table → failure table → memory line**. These are **design choices and example numbers**, not claims about Apple's systems.
+> **Purpose:** Compact interview revision for the **same Order API** across high availability, overload, and regional disaster recovery. Read each **diagram → concept table → failure table → follow-up Q&A → memory line**. These are **design choices and example numbers**, not claims about Apple's systems.
 >
 > **Baseline:** Client → DNS → AWS WAF/API Gateway → internal ALB → EKS Order API (3 AZs) → Redis (optional cache) / RDS PostgreSQL (source of truth). Example forecast: **3,762 peak RPS**, **24 pods = 8 per AZ**, and **300 planned RPS/pod**. All capacity depends on load testing.
+
+Diagram compatibility: The three diagrams below deliberately use **short, single-line Mermaid nodes** (no HTML line breaks) to avoid GitHub's clipped text. Failure actions are also listed in tables for easy reading.
 
 ---
 
@@ -10,24 +12,24 @@
 
 **Goal:** A pod, node, AZ, cache, or DB instance failure should not bring down the whole service.
 
-### Diagram 1 — Components and failure logic
+### Diagram 1 — Component flow and failure response
 
-~~~mermaid
+```mermaid
 flowchart TD
-    A["Client / Browser<br/>Timeout: bounded retry; POST: same idempotency key"]
-    B["Route 53 DNS<br/>Lookup failure: inspect DNS"]
-    C["AWS WAF + API Gateway<br/>401/403: auth/rules; 429: throttling"]
-    D["VPC Link V2 + Internal ALB<br/>Unhealthy targets: health checks / routing"]
-    E["EKS Order API in 3 AZs<br/>Pod/node failure: replicas; Pending: node scaling"]
-    R["Redis (HA cache)<br/>Miss/failure: bounded PostgreSQL fallback"]
-    P["RDS PostgreSQL primary<br/>Slow: inspect queries/pools; down: HA failover"]
-    S["RDS synchronous standby<br/>Promoted if primary fails"]
-    A --> B --> C --> D --> E
-    E -->|"cacheable GET"| R
-    E -->|"POST / consistent GET"| P
-    R -->|"miss (if capacity permits)"| P
-    P -.->|"synchronous HA replication"| S
-~~~
+    U["Customer: safe retries"]
+    DNS["Route 53: check DNS resolution"]
+    GW["WAF + API Gateway: auth and limits"]
+    LB["VPC Link + internal ALB: healthy targets"]
+    API["EKS in 3 AZs: replace failed pods"]
+    REDIS["Redis cache: bounded DB fallback"]
+    DB["RDS primary: managed failover"]
+    STBY["RDS standby: promotion target"]
+    U --> DNS --> GW --> LB --> API
+    API -->|"Cacheable GET"| REDIS
+    API -->|"POST or consistent GET"| DB
+    REDIS -->|"Cache miss"| DB
+    DB -.->|"Synchronous HA replication"| STBY
+```
 
 *AWS detail:* With ALB **IP targets**, the ALB routes directly to pod IPs; Kubernetes Ingress/Service configuration is not an extra proxy hop. A standard RDS Multi-AZ **standby is not a read replica**.
 
@@ -54,6 +56,17 @@ flowchart TD
 | PostgreSQL primary | Managed standby promotion; reconnect; verify committed orders |
 | Bad deployment | Stop rollout / pipeline rollback; validate user-journey metrics |
 
+### Interview follow-up Q&A — D03
+
+| Interviewer asks | Short answer |
+|---|---|
+| Pods are Running; why are all ALB targets unhealthy? | Check readiness, target-group health reasons, port/path and network rules. |
+| HPA adds pods but they stay Pending? | Check scheduler events, requests, AZ spread, quotas and node autoscaler. |
+| One AZ fails: is the API still available? | Only if surviving pods **and dependencies** have adequate capacity. |
+| Why use PostgreSQL instead of Redis for writes? | SQL transaction and durability guarantee; Redis is an optional cache. |
+| Primary DB fails during an order POST? | Fail over, reconnect and resolve uncertain commits using the **same idempotency key**. |
+| Redis and PostgreSQL disagree? | PostgreSQL is authoritative; bypass/invalidate stale cached data. |
+
 **Remember:** **DNS → Gateway → ALB → EKS → Redis/DB → HA failover**.
 
 ---
@@ -62,27 +75,27 @@ flowchart TD
 
 **Goal:** A 10× traffic spike or slow dependency must not trigger a cascading outage.
 
-### Diagram 2 — Components and protection logic
+### Diagram 2 — Overload path and protection
 
-~~~mermaid
+```mermaid
 flowchart TD
-    A["Client<br/>Bounded retries + backoff + jitter"]
-    B["API Gateway<br/>10x traffic: quotas / throttling (429)"]
-    C["ALB<br/>Target errors: health / latency / 502-504"]
-    D["EKS Order API<br/>Limit in-flight work; shed excess (503)"]
-    H["HPA + Node Autoscaler<br/>Scale only when dependencies have headroom"]
-    R["Redis<br/>Slow: short timeout; down: bounded fallback"]
-    CP["DB connection pool / RDS Proxy<br/>Pool full: bounded waits + concurrency limits"]
-    P["PostgreSQL<br/>Slow: inspect locks, query plans, CPU, I/O"]
-    X["External service<br/>Timeout + circuit breaker + bulkhead"]
-    A --> B --> C --> D
-    D -.->|"capacity metrics"| H
-    D -->|"cacheable GET"| R
-    D -->|"writes / consistent reads"| CP
-    R -->|"miss; admit safely"| CP
-    CP --> P
-    D -->|"optional API call"| X
-~~~
+    U["Client: retry budget, jitter"]
+    GW["API Gateway: rate limit (429)"]
+    LB["ALB: inspect target health"]
+    API["EKS API: back-pressure, shedding"]
+    SCALE["HPA + node scaler: add safe capacity"]
+    REDIS["Redis slow: timeout and fallback"]
+    POOL["DB pool full: bound concurrent work"]
+    DB["PostgreSQL slow: inspect waits and SQL"]
+    EXT["External API slow: breaker and bulkhead"]
+    U --> GW --> LB --> API
+    API -.->|"Scale if safe"| SCALE
+    API -->|"Cacheable GET"| REDIS
+    API -->|"Writes / consistent reads"| POOL
+    REDIS -->|"Bounded fallback"| POOL
+    POOL --> DB
+    API -->|"External calls"| EXT
+```
 
 **Example:** 10× forecast peak = **37,620 RPS**. At 300 RPS/pod, 24 pods can plan for only **7,200 RPS**. HPA cannot instantly create enough *safe end-to-end* capacity.
 
@@ -113,6 +126,20 @@ flowchart TD
 | External API: slow | Deadline, circuit breaker, bulkhead, safe fallback only |
 | Retry storm | Reduce retries; deadline + jitter + budget + idempotency |
 
+### Interview follow-up Q&A — D04
+
+| Interviewer asks | Short answer |
+|---|---|
+| What happens to HPA during a retry storm? | CPU may stay low while requests wait; CPU-based HPA may **not scale**. If CPU rises, more pods may overload DB further. |
+| Why does a 5-second query hurt with unchanged RPS? | In-flight work rises (roughly RPS × latency); pools and workers fill. |
+| Can retries turn 1 request into 27 DB calls? | Yes, **if** 3 independent layers each try up to 3 times; avoid layered retries. |
+| What's backoff vs jitter? | Backoff spaces retries; jitter randomizes their timing. |
+| Pool has 20 connections/pod; increase to 100? | Not blindly: first inspect pool waits, DB saturation and total pod × pool connections. |
+| Why use a circuit breaker vs a timeout? | Timeout bounds one wait; breaker temporarily stops repeatedly failing calls. |
+| Why not queue every request at 10× traffic? | Unbounded queues inflate latency and timeouts; cap work and shed excess. |
+| Redis fails during the peak—what now? | Short timeout + circuit breaker; **limit** PostgreSQL fallback and protect DB. |
+| Should POST be retried after timeout? | Only safely, retaining the same durable idempotency key and honoring deadlines. |
+
 **Remember:** **Rate limit → Back-pressure → Timeouts → Breaker → Shed load → Verify recovery**.
 
 ---
@@ -123,32 +150,28 @@ flowchart TD
 
 **Design choice:** **Active-passive / warm standby**. Mumbai serves traffic; Hyderabad is provisioned for recovery. PostgreSQL cross-region replication is **asynchronous** (unlike synchronous standby replication *within* Mumbai).
 
-### Diagram 3 — Regional failover and failback
+### Diagram 3 — Region failure, recovery and failback
 
-~~~mermaid
+```mermaid
 flowchart TD
     U["Customer"]
-    DNS["Route 53 failover DNS<br/>Cut traffic over only when DR is ready"]
-    subgraph M["Mumbai — ACTIVE"]
-       MA["WAF / API Gateway / ALB / EKS<br/>Local pod/AZ loss: HA"]
-       MP["PostgreSQL writer + Multi-AZ standby<br/>Whole region down: DR activation"]
-       MR["Redis cache<br/>Rebuildable, not source of truth"]
-       MA --> MP
-       MA --> MR
-    end
-    subgraph H["Hyderabad — WARM STANDBY"]
-       HA["WAF / API Gateway / ALB / EKS<br/>Scale and validate for full traffic"]
-       HP["PostgreSQL cross-region replica<br/>Promote to writer after DR decision"]
-       HR["Redis cache<br/>Warm or rebuild gradually"]
-       HA --> HP
-       HA --> HR
-    end
-    U --> DNS
-    DNS -->|"normal"| MA
-    MP -.->|"async DB replication; possible lag"| HP
-    DNS -.->|"after readiness / safe cutover"| HA
-    HP -.-> FB["Failback: reconcile data → reverse sync → verify → shift back"]
-~~~
+    DNS["Route 53: fail over after DR is ready"]
+    MAPP["Mumbai: Gateway / ALB / EKS"]
+    MDB["Mumbai: DB writer + AZ standby"]
+    MC["Mumbai: Redis cache"]
+    HDB["Hyderabad: DR database replica"]
+    HAPP["Hyderabad: scale and verify API"]
+    HC["Hyderabad: Redis warm or rebuild"]
+    FB["Failback: reconcile, sync, switch"]
+    U --> DNS -->|"Normal"| MAPP
+    MAPP --> MDB
+    MAPP --> MC
+    MDB -.->|"Asynchronous replication"| HDB
+    HDB -->|"Promote after fencing old writer"| HAPP
+    DNS -.->|"Controlled DR cutover"| HAPP
+    HAPP --> HC
+    HAPP --> FB
+```
 
 ### Concepts — Simple explanation
 
@@ -175,6 +198,18 @@ flowchart TD
 | DR cache empty | Gradually warm Redis; throttle DB fallback |
 | Regional routing | Shift Route 53 **after** DR write path and app are ready; consider DNS caching |
 | Mumbai recovers | Reconcile → establish reverse replication → validate → controlled failback |
+
+### Interview follow-up Q&A — D05
+
+| Interviewer asks | Short answer |
+|---|---|
+| Why active-passive, not active-active? | Simpler write consistency and fewer cross-region conflicts; lower running cost. |
+| What's RTO vs RPO? | RTO = acceptable recovery time; RPO = acceptable data-loss window. |
+| Does DB replication guarantee zero loss? | No; async cross-region replication can lag. Reconcile missing/uncertain orders. |
+| Route 53 switches automatically—are we done? | No. First fence old writer, promote DR DB and verify regional service capacity. |
+| Can warm standby handle 3,762 RPS immediately? | Not necessarily; test quotas, node scale-up, cache and DB before cutover. |
+| What about clients using old DNS records? | DNS caching delays cutover; old region must not accept conflicting writes. |
+| When should we fail back to Mumbai? | After data reconciliation, reverse replication, validation and planned traffic shift. |
 
 **Remember:** **Detect → Prevent dual writers → Promote DB → Scale → Verify → Switch DNS → Failback**.
 
