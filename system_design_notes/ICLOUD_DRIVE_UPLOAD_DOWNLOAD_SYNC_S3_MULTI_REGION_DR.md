@@ -66,6 +66,9 @@ Example: a Mac uploads a **500 MB** video. Illustrative choice: five 100 MB part
 
 ### Upload path
 
+<img width="1042" height="2384" alt="image" src="https://github.com/user-attachments/assets/c20cc068-00bf-43ea-83e9-a6926f61c599" />
+
+
 ```mermaid
 flowchart TD
     A["1. Mac detects a new file"]
@@ -105,6 +108,8 @@ flowchart TD
 ## 4. Download path
 
 ### Download path
+<img width="1128" height="2036" alt="image" src="https://github.com/user-attachments/assets/88f36b53-4037-4b1c-a57b-23d20f5a51ff" />
+
 
 ```mermaid
 flowchart TD
@@ -150,6 +155,8 @@ Example DB schema (simplified):
 - **Content/delta sync:** how much file content must be transferred?
 
 ### Mac-to-iPhone synchronization
+
+<img width="576" height="1820" alt="image" src="https://github.com/user-attachments/assets/85974a8c-3da6-4317-8e3d-81197bb77c10" />
 
 ```mermaid
 flowchart TD
