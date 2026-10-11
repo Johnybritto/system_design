@@ -14,6 +14,8 @@ Diagram compatibility: The three diagrams below deliberately use **short, single
 
 ### Diagram 1 — Component flow and failure response
 
+<img width="896" height="2348" alt="image" src="https://github.com/user-attachments/assets/284217a8-c5f4-47ed-bcf5-372224a1dffb" />
+
 ```mermaid
 flowchart TD
     U["Customer: safe retries"]
@@ -31,7 +33,7 @@ flowchart TD
     DB -.->|"Synchronous HA replication"| STBY
 ```
 
-<img width="448" height="758" alt="image" src="https://github.com/user-attachments/assets/35da3244-0605-4b18-80ab-ade8ef14e435" />
+
 
 
 *AWS detail:* With ALB **IP targets**, the ALB routes directly to pod IPs; Kubernetes Ingress/Service configuration is not an extra proxy hop. A standard RDS Multi-AZ **standby is not a read replica**.
@@ -157,6 +159,8 @@ flowchart TD
 **Design choice:** **Active-passive / warm standby**. Mumbai serves traffic; Hyderabad is provisioned for recovery. PostgreSQL cross-region replication is **asynchronous** (unlike synchronous standby replication *within* Mumbai).
 
 ### Diagram 3 — Region failure, recovery and failback
+
+<img width="1512" height="2480" alt="image" src="https://github.com/user-attachments/assets/88961709-0737-4b41-aeb2-fe22f6a0f528" />
 
 ```mermaid
 flowchart TD
