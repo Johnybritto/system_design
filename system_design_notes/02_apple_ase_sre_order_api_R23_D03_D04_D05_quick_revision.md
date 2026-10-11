@@ -16,22 +16,6 @@ Diagram compatibility: The three diagrams below deliberately use **short, single
 
 <img width="896" height="2348" alt="image" src="https://github.com/user-attachments/assets/284217a8-c5f4-47ed-bcf5-372224a1dffb" />
 
-```mermaid
-flowchart TD
-    U["Customer: safe retries"]
-    DNS["Route 53: check DNS resolution"]
-    GW["WAF + API Gateway: auth and limits"]
-    LB["VPC Link + internal ALB: healthy targets"]
-    API["EKS in 3 AZs: replace failed pods"]
-    REDIS["Redis cache: bounded DB fallback"]
-    DB["RDS primary: managed failover"]
-    STBY["RDS standby: promotion target"]
-    U --> DNS --> GW --> LB --> API
-    API -->|"Cacheable GET"| REDIS
-    API -->|"POST or consistent GET"| DB
-    REDIS -->|"Cache miss"| DB
-    DB -.->|"Synchronous HA replication"| STBY
-```
 
 
 
