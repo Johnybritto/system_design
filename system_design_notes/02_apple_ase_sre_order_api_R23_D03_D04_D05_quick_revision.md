@@ -69,25 +69,7 @@ Diagram compatibility: The three diagrams below deliberately use **short, single
 <img width="2124" height="2274" alt="image" src="https://github.com/user-attachments/assets/b4dd7233-161f-4254-bdac-cce69f859438" />
 
 
-```mermaid
-flowchart TD
-    U["Client: retry budget, jitter"]
-    GW["API Gateway: rate limit (429)"]
-    LB["ALB: inspect target health"]
-    API["EKS API: back-pressure, shedding"]
-    SCALE["HPA + node scaler: add safe capacity"]
-    REDIS["Redis slow: timeout and fallback"]
-    POOL["DB pool full: bound concurrent work"]
-    DB["PostgreSQL slow: inspect waits and SQL"]
-    EXT["External API slow: breaker and bulkhead"]
-    U --> GW --> LB --> API
-    API -.->|"Scale if safe"| SCALE
-    API -->|"Cacheable GET"| REDIS
-    API -->|"Writes / consistent reads"| POOL
-    REDIS -->|"Bounded fallback"| POOL
-    POOL --> DB
-    API -->|"External calls"| EXT
-```
+
 
 **Example:** 10× forecast peak = **37,620 RPS**. At 300 RPS/pod, 24 pods can plan for only **7,200 RPS**. HPA cannot instantly create enough *safe end-to-end* capacity.
 
@@ -146,26 +128,7 @@ flowchart TD
 
 <img width="1512" height="2480" alt="image" src="https://github.com/user-attachments/assets/88961709-0737-4b41-aeb2-fe22f6a0f528" />
 
-```mermaid
-flowchart TD
-    U["Customer"]
-    DNS["Route 53: fail over after DR is ready"]
-    MAPP["Mumbai: Gateway / ALB / EKS"]
-    MDB["Mumbai: DB writer + AZ standby"]
-    MC["Mumbai: Redis cache"]
-    HDB["Hyderabad: DR database replica"]
-    HAPP["Hyderabad: scale and verify API"]
-    HC["Hyderabad: Redis warm or rebuild"]
-    FB["Failback: reconcile, sync, switch"]
-    U --> DNS -->|"Normal"| MAPP
-    MAPP --> MDB
-    MAPP --> MC
-    MDB -.->|"Asynchronous replication"| HDB
-    HDB -->|"Promote after fencing old writer"| HAPP
-    DNS -.->|"Controlled DR cutover"| HAPP
-    HAPP --> HC
-    HAPP --> FB
-```
+
 
 ### Concepts — Simple explanation
 
