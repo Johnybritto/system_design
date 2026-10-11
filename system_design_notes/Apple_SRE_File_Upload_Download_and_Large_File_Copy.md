@@ -68,6 +68,16 @@ print("Copy completed")
 **Disk-full follow-up:** If the destination runs out of space, a write raises `OSError` (often `errno.ENOSPC`). The final rename is not reached. Handle the exception, alert/report failure, and clean up the incomplete temp file when safe. A preflight free-space check is useful but not sufficient, because available space can change.
 
 ## 3. Python: basic S3 upload and download
+this is the only 4 line you need to remm
+```python
+import boto3
+
+s3=boto3.client(“S3”)
+Bucket = "my-bucket”
+s3.upload_file(path, bucket, s3_key)
+
+s3_download_file(bucket,s3key, path)
+```
 
 ```python
 import boto3
