@@ -1,6 +1,6 @@
 # iCloud Drive-Like System Design — Upload, Download, List, Search, Sync and Multi-Region DR
 
-> **Apple ASE SRE interview notes (30–45 min).** This is a proposed educational architecture, **not** a description of Apple's private implementation. AWS components are primary; Azure equivalents are shown in parentheses. Keep the diagrams separate and top-to-bottom for legibility on GitHub.
+> **Apple ASE SRE interview notes (30–45 min).** This is a proposed educational architecture, **not** a description of Apple's private implementation. AWS components are primary; Azure equivalents are shown in parentheses. The six Mermaid diagrams below match the diagrams presented in our original discussion; extra visualization diagrams have been removed.
 
 ## 1. Requirements and central idea
 
@@ -29,28 +29,33 @@
 | Notification service | Wake devices so they can fetch changes | Push/WebSocket + polling fallback |
 | Observability | SLIs, errors, latency, queue lag, replication lag | CloudWatch/Prometheus/Grafana (Azure Monitor) |
 
-### Diagram 1 — High-level architecture
+### High-level architecture
 
 ```mermaid
 flowchart TB
-    C["Mac / iPhone / Web<br/>Sync Client"]
-    G["API Gateway / Load Balancer"]
-    A["Auth + Metadata Service<br/>Stateless K8s Pods"]
-    DB[("PostgreSQL<br/>Files / Versions / Change Log")]
-    R[("Redis<br/>Optional Cache")]
-    O[("S3 / Azure Blob<br/>Actual File Bytes")]
-    Q["Queue<br/>SQS / Service Bus"]
-    W["Workers"]
-    SI[("Search Index")]
+    C["iPhone / Mac / Browser<br/>Client Sync Engine"]
+    L["Load Balancer / API Gateway"]
+    A["Authentication"]
+    M["Metadata and File Service<br/>Kubernetes Pods"]
+    D[("PostgreSQL<br/>Metadata DB")]
+    R[("Redis Cache<br/>Optional")]
+    S[("S3 / Azure Blob<br/>File Contents")]
+    Q["Event Queue<br/>SQS / Service Bus"]
+    W["Indexing Workers"]
+    I[("Search Index")]
     N["Notification Service"]
-    C -->|"Control API"| G --> A
-    A <--> DB
-    A <--> R
-    A -->|"Signed URL"| C
-    C <-->|"Direct upload / download"| O
-    DB -->|"Committed outbox events"| Q
-    Q --> W --> SI
-    Q --> N -->|"Change signal"| C
+    C -->|"API requests"| L
+    L --> A
+    L --> M
+    M <--> D
+    M <--> R
+    M -->|"Create upload / download URLs"| C
+    C <-->|"Direct file transfer"| S
+    M -->|"Change event"| Q
+    Q --> W
+    W --> I
+    Q --> N
+    N -->|"Change signal"| C
 ```
 
 **Why a database if S3 has object names?** Efficient folders, owner checks, pagination, quotas, version conflicts, change feed, and transactional metadata are not provided by S3 object listing alone.
@@ -59,25 +64,25 @@ flowchart TB
 
 Example: a Mac uploads a **500 MB** video. Illustrative choice: five 100 MB parts; actual part sizes are configurable and constrained by object-storage limits.
 
-### Diagram 2 — Upload path (including retries and commit)
+### Upload path
 
 ```mermaid
-flowchart TB
-    A["1. Mac detects new / modified file"]
-    B["2. Authenticate via API Gateway"]
-    C["3. Check quota, permissions,<br/>existing version"]
-    D["4. DB: create UPLOADING session"]
-    E["5. Initiate multipart upload<br/>Return per-part signed URLs"]
-    F["6. Mac uploads parts directly to S3"]
-    G{"All parts uploaded?"}
-    H["Retry missing parts<br/>Bounded backoff + jitter"]
-    I["7. Complete multipart upload<br/>Verify stored object"]
-    J["8. Commit metadata: ACTIVE + new version<br/>and outbox event atomically"]
-    K["9. Relay event to durable queue"]
-    L["10. Index + notify other devices"]
+flowchart TD
+    A["1. Mac detects a new file"]
+    B["2. API Gateway authenticates request"]
+    C["3. Metadata Service<br/>Checks quota and file version"]
+    D["4. Metadata DB<br/>Creates UPLOADING session"]
+    E["5. Upload Service<br/>Creates multipart upload<br/>Returns signed URLs"]
+    F["6. Mac uploads parts<br/>Directly to S3"]
+    G{"All parts<br/>uploaded?"}
+    H["Retry missing parts<br/>with backoff"]
+    I["7. Complete multipart upload<br/>Verify object"]
+    J["8. Metadata DB<br/>Mark file ACTIVE"]
+    K["9. Queue change event"]
+    L["10. Search indexing +<br/>Device notifications"]
     A --> B --> C --> D --> E --> F --> G
-    G -->|"No"| H --> F
-    G -->|"Yes"| I --> J --> K --> L
+    G -->|No| H --> F
+    G -->|Yes| I --> J --> K --> L
 ```
 
 **Step-by-step logic**
@@ -99,21 +104,23 @@ flowchart TB
 
 ## 4. Download path
 
-### Diagram 3 — Download and resume
+### Download path
 
 ```mermaid
-flowchart TB
-    A["1. iPhone requests file ID / version"]
-    B["2. API validates identity + ACL"]
-    C["3. Metadata DB finds immutable object key"]
-    D["4. API issues short-lived signed GET URL"]
-    E["5. iPhone GETs S3 object directly"]
-    F{"Finished and<br/>checksum valid?"}
-    G["Retry missing byte ranges<br/>for same object version"]
-    H["6. Save local cache + synced version"]
-    A --> B --> C --> D --> E --> F
-    F -->|"No"| G --> E
-    F -->|"Yes"| H
+flowchart TD
+    A["1. iPhone requests video.mp4"]
+    B["2. Load Balancer / API Gateway"]
+    C["3. Metadata Service<br/>Validate authentication and access"]
+    D[("4. Metadata DB<br/>Find object key + file version")]
+    E["5. Download Service<br/>Generate signed GET URL"]
+    F["6. iPhone connects to S3<br/>Directly"]
+    G["7. Download bytes<br/>Range requests if needed"]
+    H{"Complete and<br/>checksum valid?"}
+    I["Retry missing byte ranges"]
+    J["8. Save to local device cache<br/>Mark version synchronized"]
+    A --> B --> C --> D --> E --> F --> G --> H
+    H -->|No| I --> G
+    H -->|Yes| J
 ```
 
 - On disconnect after 300 MiB, an HTTP **Range: bytes=314572800-** request can fetch remaining bytes; use the same immutable object version/ETag precondition.
@@ -123,24 +130,6 @@ flowchart TB
 
 ## 5. List files and search files
 
-### Diagram 4 — List versus search
-
-```mermaid
-flowchart TB
-    C["Client"]
-    A["API Gateway + Auth"]
-    X{"Operation?"}
-    M["Metadata Service"]
-    DB[("PostgreSQL<br/>Folder + File Rows")]
-    S["Search Service"]
-    IDX[("Search Index<br/>Optional")]
-    C --> A --> X
-    X -->|"List folder"| M --> DB
-    X -->|"Search name"| S --> IDX
-    S -.->|"Simple MVP alternative"| DB
-    DB -->|"Authorized file metadata"| C
-    IDX -->|"Permission-filtered matches"| C
-```
 
 - **List:** GET /folders/{id}/files?limit=50&cursor=... → DB index on owner + parent folder + ordering key; cursor pagination.
 - **Search:** GET /files/search?q=report → for MVP, PostgreSQL indexed filename search; later OpenSearch for large scale. Always enforce user/folder permissions.
@@ -160,19 +149,19 @@ Example DB schema (simplified):
 - **Device/metadata sync:** what changed since this device last checked?
 - **Content/delta sync:** how much file content must be transferred?
 
-### Diagram 5 — Mac to iPhone synchronization
+### Mac-to-iPhone synchronization
 
 ```mermaid
-flowchart TB
-    A["Mac commits version 2"]
-    B["DB: new version + durable change sequence"]
-    C["Outbox → queue → notification"]
-    D["iPhone receives wake-up<br/>or reconnects later"]
-    E["GET /changes?cursor=150"]
-    F["Server returns changes + new cursor"]
-    G["iPhone checks local versions"]
-    H["Download missing / updated content"]
-    I["Persist updated cursor locally"]
+flowchart TD
+    A["Mac uploads file version 2"]
+    B["Metadata Service commits version 2"]
+    C["Change log records new sequence"]
+    D["Event Queue"]
+    E["Notification Service"]
+    F["iPhone receives change signal"]
+    G["iPhone requests changes since<br/>last stored cursor"]
+    H["Metadata Service returns<br/>new file version"]
+    I["iPhone downloads required bytes"]
     A --> B --> C --> D --> E --> F --> G --> H --> I
 ```
 
@@ -181,22 +170,6 @@ flowchart TB
 - Maintain file versions and optimistic-concurrency checks. If Mac and iPhone both edit starting from v4, don't overwrite silently; return a conflict and preserve both copies or provide explicit merge semantics.
 - Deletes require a durable change/tombstone so offline devices learn about deletions.
 
-### Diagram 6 — File-level delta concept
-
-```mermaid
-flowchart TB
-    A["Existing file v1<br/>Chunks A, B, C, D"]
-    B["Edited file v2"]
-    C["Calculate block/chunk checksums"]
-    D{"Which chunks changed?"}
-    E["A / B / D unchanged<br/>Reuse existing chunks"]
-    F["C changed<br/>Upload new chunk"]
-    G["Publish new version manifest<br/>after checksum verification"]
-    A --> C
-    B --> C --> D
-    D --> E --> G
-    D --> F --> G
-```
 
 **Whole-file:** simplest; changed file re-uploads as a new object version.  
 **Multipart:** splits a transfer; retries parts, no cross-version dedup by itself.  
@@ -207,22 +180,6 @@ flowchart TB
 
 ## 7. Scaling the system
 
-### Diagram 7 — What scales independently
-
-```mermaid
-flowchart TB
-    C["Many client devices"]
-    L["Load Balancer / API Gateway"]
-    A["Metadata APIs<br/>HPA: 3 → N replicas"]
-    DB[("Metadata PostgreSQL<br/>Indexes / Pool / Read Replicas")]
-    O[("S3 Storage<br/>Parallel transfers")]
-    Q["Queue<br/>More change events"]
-    W["Workers<br/>Scale on queue lag"]
-    IDX[("Search Cluster<br/>Shards / Replicas")]
-    C -->|"Small control requests"| L --> A --> DB
-    C <-->|"Large object bytes"| O
-    DB -->|"Outbox relay"| Q --> W --> IDX
-```
 
 | Bottleneck | First response | Next step |
 |---|---|---|
@@ -238,27 +195,6 @@ flowchart TB
 
 ## 8. Failure handling
 
-### Diagram 8 — Upload failure decision flow
-
-```mermaid
-flowchart TB
-    A["Upload or commit fails"]
-    B{"Which layer?"}
-    C["Network / S3 part failure"]
-    D["Retry specific part<br/>Backoff + jitter"]
-    E["Metadata pod failure"]
-    F["Call another stateless pod<br/>Resume stored upload session"]
-    G["DB or queue failure"]
-    H["DB: don't claim commit<br/>Outbox: retry async publication"]
-    I["Reconcile incomplete sessions<br/>and abandoned objects"]
-    A --> B
-    B --> C --> D
-    B --> E --> F
-    B --> G --> H
-    D --> I
-    F --> I
-    H --> I
-```
 
 | Failure | Impact | Recovery |
 |---|---|---|
@@ -279,20 +215,6 @@ flowchart TB
 
 **Bucket storage is regional.** You can access a bucket over the network from anywhere, but an ordinary S3 bucket is created in a specific AWS Region. S3 Standard stores objects redundantly across **at least three Availability Zones in that Region**. It does **not** automatically copy them into a different AWS Region.
 
-### Diagram 9 — Single-AZ failure inside one Region
-
-```mermaid
-flowchart TB
-    S["S3 Standard bucket<br/>us-east-1 (one Region)"]
-    A["Availability Zone A<br/>Healthy"]
-    B["Availability Zone B<br/>Failed"]
-    C["Availability Zone C<br/>Healthy"]
-    S --> A
-    S --> B
-    S --> C
-    A --> OK["S3 Standard designed to<br/>withstand AZ loss"]
-    C --> OK
-```
 
 **One AZ down:** redundancy across AZs means normal S3 Standard data access is designed to survive that failure (subject to real operational service health). Note: S3 One Zone storage classes have different resilience.
 
@@ -307,50 +229,35 @@ Use **active/passive** as the initial design. Region 1 serves traffic; Region 2 
 
 CRR does not automatically replicate database state, EKS resources, routing, or all application secrets/configuration.
 
-### Diagram 10 — Region failure and failover architecture
+### S3 cross-region disaster recovery
 
 ```mermaid
 flowchart TB
-    C["Mac / iPhone"]
-    G["Global API routing<br/>Health-based failover"]
-    C --> G
-    subgraph P["PRIMARY — us-east-1"]
-        PA["EKS Metadata API"]
-        PD[("Primary PostgreSQL")]
-        PS[("Primary S3 Bucket")]
-        PA --> PD
-        PA -->|"Signed URL creation"| PS
+    U["iPhone / Mac"]
+    G["Global API Routing<br/>Route 53 / Global Accelerator"]
+    U --> G
+    subgraph EAST["Primary: us-east-1"]
+        A["EKS API + Sync Service"]
+        D[("Metadata Database")]
+        S[("S3 Primary Bucket")]
+        A --> D
+        A -->|"Signed upload URLs"| S
     end
-    subgraph S["STANDBY — us-west-2"]
-        SA["Standby EKS Metadata API"]
-        SD[("Replica PostgreSQL")]
-        SS[("Replica S3 Bucket")]
-        SA --> SD
-        SA -->|"Signed URL creation"| SS
+    subgraph WEST["Secondary: us-west-2"]
+        B["Standby EKS API + Sync Service"]
+        R[("Replicated Metadata DB")]
+        T[("S3 Replica Bucket")]
+        B --> R
+        B -->|"Signed download URLs"| T
     end
-    G -->|"Normal API traffic"| PA
-    G -.->|"After failover"| SA
-    PD -->|"DB async replication"| SD
-    PS -->|"S3 CRR async replication"| SS
+    G -->|"Normal traffic"| A
+    G -.->|"Failover traffic"| B
+    D -->|"DB replication"| R
+    S -->|"Asynchronous S3 CRR"| T
 ```
 
 **Important clarification:** application APIs issue signed object URLs; the bytes travel directly **from the client to the bucket**, even though arrows within the region above show where the API gets object target information.
 
-### Diagram 11 — Safe regional failover sequence
-
-```mermaid
-flowchart TB
-    A["Primary Region becomes unavailable"]
-    B["Detect + declare incident"]
-    C["Fence primary writers<br/>Prevent split-brain"]
-    D["Check standby app, DB replay lag,<br/>replica object availability"]
-    E["Promote secondary DB<br/>Update storage/routing configuration"]
-    F["Shift global API routing to standby"]
-    G["Issue new signed URLs<br/>for secondary S3 bucket"]
-    H["Clients resume/retry<br/>Reconcile missing versions"]
-    I["Rebuild primary / repair replication<br/>before controlled failback"]
-    A --> B --> C --> D --> E --> F --> G --> H --> I
-```
 
 **Why failover both storage and DB?** Even if files are copied, the application needs correct file-version metadata and permissions to safely list or retrieve them.
 
@@ -358,15 +265,6 @@ flowchart TB
 
 ### The critical edge case: regional failure before CRR catches up
 
-```mermaid
-flowchart TB
-    A["10:00:00 Upload completes in Region A"]
-    B["10:00:02 Object exists in primary bucket"]
-    C["10:00:03 Region A outage<br/>CRR still pending"]
-    D["Secondary DB may know file version<br/>but secondary S3 may lack object"]
-    E["Mark version temporarily unavailable<br/>or recover from client/primary later"]
-    A --> B --> C --> D --> E
-```
 
 Do **not** promise zero loss with async CRR. Object missing in secondary may be *temporarily* unavailable or irrecoverable if the primary never recovers and the object was not replicated. Reconcile object existence against DB pointers. New uploads after failover go to standby only after writer fencing and consistency checks.
 
@@ -391,32 +289,35 @@ To target near-zero RPO, an option is to acknowledge a new upload as cross-regio
 
 ## 11. Complete mental model — Mac upload to iPhone download
 
-### Diagram 12 — End-to-end combined flow
+### End-to-end file journey
 
 ```mermaid
 flowchart TB
-    subgraph U["UPLOAD FROM MAC"]
-        A["Mac detects change"]
-        B["API: authorize + start upload"]
-        C["Mac → S3 direct multipart"]
-        D["Verify; commit new metadata version"]
-        A --> B --> C --> D
+    subgraph Upload["UPLOAD PATH"]
+        A["Mac detects new file"]
+        B["API authenticates user"]
+        C["Metadata DB creates session"]
+        D["Mac uploads parts directly to S3"]
+        E["Complete and verify upload"]
+        F["Metadata DB commits new version"]
+        A --> B --> C --> D --> E --> F
     end
-    subgraph Y["SYNC"]
-        E["DB change log + outbox"]
-        F["Queue → device notification"]
-        G["iPhone fetches changes by cursor"]
-        E --> F --> G
+    subgraph Sync["SYNCHRONIZATION"]
+        G["Durable change event"]
+        H["Notification to iPhone"]
+        I["iPhone fetches change log"]
+        G --> H --> I
     end
-    subgraph V["DOWNLOAD TO IPHONE"]
-        H["API checks permissions + version"]
-        I["Return signed GET URL"]
-        J["iPhone → S3 GET / Range"]
-        K["Validate, cache, update sync cursor"]
-        H --> I --> J --> K
+    subgraph Download["DOWNLOAD PATH"]
+        J["iPhone requests file"]
+        K["API checks permissions and version"]
+        L["API returns signed download URL"]
+        M["iPhone downloads directly from S3"]
+        N["Verify and save locally"]
+        J --> K --> L --> M --> N
     end
-    D --> E
-    G --> H
+    F --> G
+    I --> J
 ```
 
 **Memorize:** **Metadata DB → Object Storage → Multipart Transfer → Durable Change Feed → Other Device → Region Failover.**
