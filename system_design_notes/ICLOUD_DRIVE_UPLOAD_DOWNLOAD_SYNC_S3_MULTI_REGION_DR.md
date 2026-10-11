@@ -69,24 +69,7 @@ Example: a Mac uploads a **500 MB** video. Illustrative choice: five 100 MB part
 <img width="1042" height="2384" alt="image" src="https://github.com/user-attachments/assets/c20cc068-00bf-43ea-83e9-a6926f61c599" />
 
 
-```mermaid
-flowchart TD
-    A["1. Mac detects a new file"]
-    B["2. API Gateway authenticates request"]
-    C["3. Metadata Service<br/>Checks quota and file version"]
-    D["4. Metadata DB<br/>Creates UPLOADING session"]
-    E["5. Upload Service<br/>Creates multipart upload<br/>Returns signed URLs"]
-    F["6. Mac uploads parts<br/>Directly to S3"]
-    G{"All parts<br/>uploaded?"}
-    H["Retry missing parts<br/>with backoff"]
-    I["7. Complete multipart upload<br/>Verify object"]
-    J["8. Metadata DB<br/>Mark file ACTIVE"]
-    K["9. Queue change event"]
-    L["10. Search indexing +<br/>Device notifications"]
-    A --> B --> C --> D --> E --> F --> G
-    G -->|No| H --> F
-    G -->|Yes| I --> J --> K --> L
-```
+
 
 **Step-by-step logic**
 
@@ -111,22 +94,6 @@ flowchart TD
 <img width="1128" height="2036" alt="image" src="https://github.com/user-attachments/assets/88f36b53-4037-4b1c-a57b-23d20f5a51ff" />
 
 
-```mermaid
-flowchart TD
-    A["1. iPhone requests video.mp4"]
-    B["2. Load Balancer / API Gateway"]
-    C["3. Metadata Service<br/>Validate authentication and access"]
-    D[("4. Metadata DB<br/>Find object key + file version")]
-    E["5. Download Service<br/>Generate signed GET URL"]
-    F["6. iPhone connects to S3<br/>Directly"]
-    G["7. Download bytes<br/>Range requests if needed"]
-    H{"Complete and<br/>checksum valid?"}
-    I["Retry missing byte ranges"]
-    J["8. Save to local device cache<br/>Mark version synchronized"]
-    A --> B --> C --> D --> E --> F --> G --> H
-    H -->|No| I --> G
-    H -->|Yes| J
-```
 
 - On disconnect after 300 MiB, an HTTP **Range: bytes=314572800-** request can fetch remaining bytes; use the same immutable object version/ETag precondition.
 - A signed GET URL must be short-lived and scoped to one authorized object; keep buckets private, use TLS and encryption at rest.
@@ -158,19 +125,7 @@ Example DB schema (simplified):
 
 <img width="576" height="1820" alt="image" src="https://github.com/user-attachments/assets/85974a8c-3da6-4317-8e3d-81197bb77c10" />
 
-```mermaid
-flowchart TD
-    A["Mac uploads file version 2"]
-    B["Metadata Service commits version 2"]
-    C["Change log records new sequence"]
-    D["Event Queue"]
-    E["Notification Service"]
-    F["iPhone receives change signal"]
-    G["iPhone requests changes since<br/>last stored cursor"]
-    H["Metadata Service returns<br/>new file version"]
-    I["iPhone downloads required bytes"]
-    A --> B --> C --> D --> E --> F --> G --> H --> I
-```
+
 
 - Notifications are **hints**, not the correctness mechanism: iPhone might be offline.
 - Each device keeps an opaque change cursor. On reconnection, fetch every relevant change since last cursor, then persist new cursor only after safely applying changes.
