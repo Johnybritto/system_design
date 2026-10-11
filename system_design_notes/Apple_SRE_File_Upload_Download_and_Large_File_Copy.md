@@ -76,7 +76,7 @@ s3=boto3.client(“S3”)
 Bucket = "my-bucket”
 s3.upload_file(path, bucket, s3_key)
 
-s3_download_file(bucket,s3key, path)
+s3.download_file(bucket,s3key, path)
 ```
 
 ```python
