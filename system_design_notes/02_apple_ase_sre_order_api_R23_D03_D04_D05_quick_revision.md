@@ -31,6 +31,9 @@ flowchart TD
     DB -.->|"Synchronous HA replication"| STBY
 ```
 
+<img width="448" height="758" alt="image" src="https://github.com/user-attachments/assets/35da3244-0605-4b18-80ab-ade8ef14e435" />
+
+
 *AWS detail:* With ALB **IP targets**, the ALB routes directly to pod IPs; Kubernetes Ingress/Service configuration is not an extra proxy hop. A standard RDS Multi-AZ **standby is not a read replica**.
 
 ### Concepts — Simple explanation
