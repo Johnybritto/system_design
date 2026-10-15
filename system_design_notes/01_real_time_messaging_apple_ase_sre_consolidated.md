@@ -409,6 +409,40 @@ BOB RECEIVES
     Bob app sends DELIVERY_ACK → update receipt → notify Alice
 ~~~
 
+
+Alice
+  |
+DNS → NLB
+  |
+WebSocket Gateway Pod 1
+  |
+Messaging Service Pod
+  |
+Database (Atomic Transaction)
+  |-- Messages
+  |-- Idempotency / Sequence
+  |-- Outbox
+  |
+  +--> ACCEPTED ACK to Alice
+  |
+Outbox Publisher Pod
+  |
+Kafka Producer → Kafka
+  |
+Delivery Worker (Consumer)
+  |
+Redis Lookup
+  |
+WebSocket Gateway Pod 2
+  |
+Bob's Mobile
+  |
+DELIVERY_ACK
+  |
+Update DB → Notify Alice
+
+
+
 **Interview mini-script:** "I use a persistent WebSocket for Alice, a Messaging Service for auth/validation/idempotency, and a transactional database write for message plus outbox. Alice is acknowledged after durability. An outbox publisher reliably feeds Kafka, Delivery Workers look up Bob's gateway using Redis, and Bob receives the message over his WebSocket. Separate recipient ACK and read receipt close the loop."
 
 ---
