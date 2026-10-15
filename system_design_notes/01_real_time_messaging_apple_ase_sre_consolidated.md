@@ -442,6 +442,40 @@ DELIVERY_ACK
 Update DB → Notify Alice
 
 
+Kafka
+  |
+  v
+Delivery Worker Pod
+  |
+  | 1. Look up Bob in Redis
+  v
+Redis
+  |
+  | 2. Bob is connected to
+  |    WebSocket Gateway Pod 2
+  v
+Delivery Worker Pod
+  |
+  | 3. Forward message to Pod 2
+  v
+WebSocket Gateway Pod 2
+  |
+  | 4. Send over existing WebSocket
+  v
+Bob's Mobile App
+  |
+  | 5. Bob sends DELIVERY_ACK
+  v
+WebSocket Gateway Pod 2
+  |
+  v
+Messaging Service
+  |
+  v
+Database (Update delivery status)
+
+
+
 
 **Interview mini-script:** "I use a persistent WebSocket for Alice, a Messaging Service for auth/validation/idempotency, and a transactional database write for message plus outbox. Alice is acknowledged after durability. An outbox publisher reliably feeds Kafka, Delivery Workers look up Bob's gateway using Redis, and Bob receives the message over his WebSocket. Separate recipient ACK and read receipt close the loop."
 
