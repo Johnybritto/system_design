@@ -409,7 +409,7 @@ BOB RECEIVES
     Bob app sends DELIVERY_ACK → update receipt → notify Alice
 ~~~
 
-
+~~~text
 Alice
   |
 DNS → NLB
@@ -440,8 +440,9 @@ Bob's Mobile
 DELIVERY_ACK
   |
 Update DB → Notify Alice
+~~~
 
-
+~~~text
 Kafka
   |
   v
@@ -473,7 +474,7 @@ Messaging Service
   |
   v
 Database (Update delivery status)
-
+~~~
 
 
 
