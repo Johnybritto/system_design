@@ -101,6 +101,14 @@ flowchart TD
 
 **Interview answer:** Cache-aside keeps loading logic in the application, whereas read-through moves it into the caching abstraction.
 
+### Q2. How do the write caching strategies differ?
+
+**Write-through:** The cache layer persists the write to the DB before acknowledging success.  
+**Write-behind:** The cache/buffer acknowledges before a later asynchronous DB flush, so durability matters.  
+**Write-around:** The application writes directly to the DB, bypasses cache population, and invalidates existing stale entries.
+
+The three diagrams and their individual advantages/disadvantages are below.
+
 ### 2.3 Write-through
 
 **How it works:** Write through the cache layer, and **persist to the database synchronously before acknowledging success**.
