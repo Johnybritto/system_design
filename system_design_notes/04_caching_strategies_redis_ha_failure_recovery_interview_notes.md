@@ -349,6 +349,76 @@ flowchart TD
 | Network issue | Timeouts/connection errors | Check DNS, SG/NSG, routes, network policies, endpoints |
 | Entire region lost | Regional cache unavailable | Fail over app and DB by DR plan; rebuild/warm cache |
 
+### Follow-up — Redis outage: backoff, rate limiting, circuit breaker and queue?
+
+**Interviewer:** Redis fails. All cache misses are now hitting the DB. I will use rate limiting, exponential backoff with jitter, circuit breakers, and put a queue in front of the database. Is this correct?
+
+**Answer: Mostly correct.** The controls make sense, but **do not put a queue in front of ordinary synchronous DB reads**. A queue is appropriate for jobs or writes whose completion the caller can wait for asynchronously.
+
+**Real-world scenario:** The API receives **10,000 read requests/sec**, with **90% Redis cache hits**. Normally approximately **1,000 DB reads/sec** arrive. If Redis becomes unavailable and everything falls back, DB load could jump toward **10,000 reads/sec** and exhaust its connections, CPU, or I/O capacity. These figures are illustrative (one DB read per uncached request).
+
+#### Diagram 8A — Synchronous GET during Redis outage
+
+```mermaid
+flowchart TD
+  A["10k reads/sec"] --> B["EKS API pods"]
+  B --> C["Redis timeout"]
+  C --> D["Redis circuit breaker"]
+  D --> E{"DB fallback budget?"}
+  E -->|Available| F["Rate + concurrency limit"]
+  F --> G[("RDS database")]
+  E -->|Exhausted| H["429 / 503 or safe stale data"]
+```
+
+**What each control does:**
+
+| Control | Purpose | Important nuance |
+|---|---|---|
+| **Redis circuit breaker** | Stop repeated calls to an unavailable cache; periodically probe for recovery | Opening the cache breaker **does not automatically protect the DB** |
+| **Rate limiting** | Cap how many requests can fall back to DB | Reject or shed excess load with an appropriate response |
+| **Bulkhead / concurrency limit** | Bound simultaneous DB fallback operations and connections | Base limits on measured DB capacity |
+| **Exponential backoff + jitter** | Spread **eligible transient retries** over time | Not every cache miss should retry; cap attempts and total deadline |
+| **DB circuit breaker** | Stop hammering an unhealthy DB | Can return 503/429 or approved stale data; preserve DB recovery |
+| **Short cache timeouts** | Avoid blocking application threads when Redis is unhealthy | Choose values from actual network latency and API SLO |
+| **Safe stale response** | Avoid DB access for selected noncritical GETs | Must obey data-freshness/authorization requirements |
+| **Redis HA + warming** | Fail over and repopulate hot entries gradually | Watch for a secondary DB spike during cache recovery |
+
+**Sequence I would explain:**
+
+1. Check managed Redis replica promotion and client reconnects.
+2. Time out failing Redis calls quickly and open the **Redis** circuit breaker.
+3. Allow only **rate-limited, concurrency-limited** reads to RDS.
+4. For extra traffic: use acceptable stale data or **429/503** instead of overwhelming RDS.
+5. Retry **only transient, retry-safe operations**, using bounded exponential backoff with jitter; stop retries when the DB is saturated.
+6. Restore/warm Redis gradually; validate API p99, 5xx, DB connections, Redis hit ratio, and eviction/replication metrics.
+
+#### Q. Why not put an SQS queue in front of every database request?
+
+For a synchronous **GET /products/1001**, the caller expects product data in the same HTTP invocation. Inserting SQS means the request must wait on a worker and a reply mechanism, or the API must return a job ID and expose a later status/result endpoint. This adds latency and operational complexity without directly fixing the simple read path.
+
+**Better for synchronous reads:** constrained fallback, rate limiting, bulkhead isolation, cache HA, and sometimes approved stale data.
+
+**Use a queue for asynchronous work:** order fulfillment, analytics ingestion, emails, or background writes whose business contract permits delayed completion.
+
+#### Diagram 8B — Queue for asynchronous DB work (not normal GETs)
+
+```mermaid
+flowchart TD
+  A["POST async job"] --> B["API"]
+  B --> C[("SQS queue")]
+  B --> D["202 + job ID"]
+  C --> E["Worker"]
+  E --> F[("Database")]
+  E -.-> G["Retry / DLQ policy"]
+```
+
+**Architect's caveats for queue-backed writes:** acknowledge only after durable enqueue, use idempotency, set retries and DLQ policy, monitor queue age and backlog, and **cap worker throughput** so replay after a DB outage does not overload the recovering database. A queue is not a substitute for making synchronous reads resilient.
+
+**Interview-ready answer:**
+
+> If Redis fails, many reads may fall through to RDS at once and create a cascading failure. I would first verify Redis failover and use short cache timeouts with a circuit breaker. I would protect RDS through rate limiting and bulkhead concurrency limits, and use safe stale responses or load shedding if capacity is exhausted. Bounded retries with exponential backoff and jitter are for transient, retry-safe failures, not every read. I would introduce SQS only for asynchronous tasks or writes that tolerate delayed completion, not for ordinary synchronous GET requests. After Redis recovers, I would gradually warm the cache and verify API and DB metrics.
+
+
 ### Q11. What about Redis Sentinel?
 
 For **self-managed** non-clustered Redis on VMs/Kubernetes, Sentinel can monitor nodes, discover the current primary and coordinate failover. A common robust design uses at least **three independently placed Sentinel instances** with quorum/majority configuration.
