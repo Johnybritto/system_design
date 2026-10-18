@@ -1,4 +1,4 @@
-# Caching in System Design — Strategies, Redis HA, Failures and Interview Q&A
+# Caching in System Design — Complete Chat Notes, Redis HA and Interview Q&A
 
 > **System Design Notes | Interview-ready consolidated guide**  
 > Focus: caching fundamentals, cache-aside vs read-through, write strategies, failure mitigation, Redis high availability, consistency, performance, durable writes, monitoring, and real-world troubleshooting.  
@@ -15,20 +15,14 @@ Caching stores frequently used data in a faster layer to avoid repeated, expensi
 ### Diagram 1 — Cache-aside API with Redis
 
 ```mermaid
-  flowchart TD
-  A["Client / Mobile App"]
-  B["API Gateway / Load Balancer"]
-  C["Application Pods - EKS / AKS"]
-  D[("Redis Cache")]
-  E[("Database - RDS / Azure SQL")]
-  A --> B --> C
-  C -->|"1. GET cached key"| D
-  D -->|"Cache HIT: value"| C
-  D -.->|"Cache MISS"| C
-  C -->|"2. On miss: query"| E
-  E -->|"3. Value"| C
-  C -->|"4. SET key + TTL"| D
-  C -->|"5. Response"| A
+flowchart TD
+  A["Client"] --> B["API / app"]
+  B --> C["Redis lookup"]
+  C --> D{"Cache hit?"}
+  D -->|Yes| E["Return data"]
+  D -->|No| F["Read database"]
+  F --> G["Cache with TTL"]
+  G --> E
 ```
 
 **Flow:** Client calls the API -> app checks Redis -> if hit, returns from cache -> if miss, app queries DB -> saves result with a TTL -> responds.
@@ -45,94 +39,142 @@ Caching stores frequently used data in a faster layer to avoid repeated, expensi
 
 ---
 
-## 2. Caching strategies
+## 2. Main caching strategies
 
-### Q1. Are cache-aside and read-through the same?
+There are **five common application caching patterns** worth learning. The choice depends on read/write patterns, consistency expectations, and failure requirements.
 
-**They look similar because both load from the DB on a miss. The key difference is WHO fetches the missing value.**
+### 2.1 Cache-aside (Lazy Loading)
 
-- **Cache-aside (lazy loading):** the *application* detects a cache miss, queries DB and sets Redis.
-- **Read-through:** a *cache abstraction / integrated loader* detects a miss, fetches DB data and populates cache without exposing the miss-handling logic to the caller.
+**How it works:** Application checks Redis first. On a **cache miss**, the **application itself** queries the database and populates Redis with the result.
 
-**Important:** Plain Redis alone does not magically know which SQL database or query to use. Read-through requires a loader, middleware, or application cache abstraction.
+**Example:** Product catalog, user profile, order status.
 
-### Diagram 2A — Cache-aside (application owns cache miss)
+**Advantage:** Simple and loads only the values that users request.  
+**Disadvantage:** First request after expiration is slower; stale entries and stampedes are possible.  
+**Mitigation:** TTL, invalidation after DB commit, cache warming and single-flight loading.
 
-```mermaid
-flowchart TD
-  A["Application"]
-  R[("Redis")]
-  D[("Database")]
-  A -->|"GET key"| R
-  R -.->|"MISS"| A
-  A -->|"DB SELECT"| D
-  D -->|"Row"| A
-  A -->|"SET key + TTL"| R
-```
-
-### Diagram 2B — Read-through (cache layer owns miss)
+### Diagram 2A — Cache-aside (app fetches the data)
 
 ```mermaid
 flowchart TD
-  A["Application"]
-  C["Cache abstraction / loader"]
-  D[("Database")]
-  A -->|"GET key"| C
-  C -->|"On MISS: fetch"| D
-  D -->|"Row"| C
-  C -->|"Value to caller"| A
+  A["App"] --> B["Redis GET"]
+  B --> C{"Cache hit?"}
+  C -->|Yes| F["Return data"]
+  C -->|No| D["App reads DB"]
+  D --> E["App updates cache"]
+  E --> F
 ```
 
-### Q2. What about the write strategies?
+### 2.2 Read-through
 
-| Strategy | Actual write path | Main trade-off |
+**How it works:** Application requests data from a **cache abstraction or integrated loader**. If the value is missing, **the cache layer** retrieves it from the database and populates the cache.
+
+**Example:** A caching middleware/library providing automatic data loading.
+
+**Advantage:** Centralizes cache loading instead of repeating miss-handling logic in multiple services.  
+**Disadvantage:** Requires an integrated loader and still has cold-miss latency.  
+**Mitigation:** Replicated cache, bounded timeouts, controlled DB fallback and preloading hot keys.
+
+### Diagram 2B — Read-through (cache layer fetches the data)
+
+```mermaid
+flowchart TD
+  A["App"] --> B["Cache"]
+  B --> C{"Cache hit?"}
+  C -->|Yes| F["Return data"]
+  C -->|No| D["Loader reads DB"]
+  D --> E["Cache is populated"]
+  E --> F
+```
+
+### Q1. Why do read-through and cache-aside look so similar?
+
+**You're correct. Both are lazy-loading approaches.** The key difference is **who handles a cache miss**:
+
+| Question | Cache-aside | Read-through |
 |---|---|---|
-| **Write-through** | App -> cache layer -> *synchronously* persist DB -> acknowledge | Fresh cached reads after successful coordinated write, but slower writes |
-| **Write-behind / write-back** | App -> cache/buffer -> acknowledge -> asynchronously persist DB | Low write latency, but accepted changes may be lost without durability |
-| **Write-around** | App -> DB directly; do not populate cache on write | Avoids polluting cache with rarely read data, but later reads miss |
+| Who fetches data on a miss? | Application | Cache layer / integrated loader |
+| Does application handle miss logic? | Yes | Usually no, it's abstracted |
+| Cache populated on first read? | Yes | Yes |
+| Is plain Redis sufficient? | Yes, with app logic | Not automatically; requires a loader/cache abstraction |
+| Common in EKS/AKS apps? | Very common | Useful with suitable cache library/middleware |
 
-### Diagram 3 — Three write paths
+**Interview answer:** Cache-aside keeps loading logic in the application, whereas read-through moves it into the caching abstraction.
 
-**Write-through:**
+### 2.3 Write-through
+
+**How it works:** Write through the cache layer, and **persist to the database synchronously before acknowledging success**.
+
+**Example:** A system where the cache should reflect the latest successfully written record.
+
+**Advantage:** Good control over read-after-write freshness.  
+**Disadvantage:** Slower writes and possible partial failure between cache and DB.  
+**Mitigation:** Durable database commit, retries or cache invalidation if cache update fails, idempotency and version handling.
+
+### Diagram 3A — Write-through
 
 ```mermaid
-flowchart LR
-  A["Application"] -->|"Write"| B["Cache layer"]
-  B -->|"Synchronous persist"| C[("Database")]
-  C -.->|"Committed"| B
-  B -.->|"Acknowledge"| A
+flowchart TD
+  A["App"] --> B["Cache"]
+  B --> C["DB write"]
+  C --> D{"DB committed?"}
+  D -->|Yes| E["Ack success"]
+  D -->|No| F["Report failure"]
 ```
 
-**Write-behind:**
+### 2.4 Write-behind (Write-back)
+
+**How it works:** Write to the cache/buffer and acknowledge early; persist the change to DB **later**, asynchronously.
+
+**Example:** Delay-tolerant counters or telemetry, not a default for payment transactions.
+
+**Advantage:** Fast writes and possible batching.  
+**Disadvantage:** The cache can fail before unflushed changes reach DB, losing acknowledged data.  
+**Mitigation:** Durable queue/WAL, replication with suitable acknowledgements, controlled retries, DLQ (where supported), recovery/replay and idempotency.
+
+### Diagram 3B — Write-behind
 
 ```mermaid
-flowchart LR
-  A["Application"] -->|"Write"| B["Cache / Buffer"]
-  B -.->|"Early ack"| A
-  B -->|"Flush asynchronously"| C[("Database")]
+flowchart TD
+  A["App"] --> B["Cache / buffer"]
+  B --> C["Ack early"]
+  B --> D["Async DB flush"]
+  D --> E[("DB")]
 ```
 
-**Write-around:**
+### 2.5 Write-around
+
+**How it works:** Write directly to DB, **bypassing cache population**. Future reads may populate the cache.
+
+**Example:** Write-heavy data that is rarely read again.
+
+**Advantage:** Avoids filling the cache with rarely used writes.  
+**Disadvantage:** First subsequent read misses, and old cached values can become stale.  
+**Mitigation:** Invalidate after successful DB commit, use TTL, and preload only genuinely hot keys.
+
+### Diagram 3C — Write-around
 
 ```mermaid
-flowchart LR
-  A["Application"] -->|"Write"| B[("Database")]
-  A -.->|"Invalidate old key after commit"| C[("Cache")]
+flowchart TD
+  A["App"] --> B[("DB")]
+  B --> C["Commit"]
+  C --> D["Invalidate old key"]
+  D --> E["Read can refill later"]
 ```
 
 ---
 
 ## 3. Which strategy should an architect select?
 
-| Strategy | Advantages | Disadvantages | **How to mitigate the disadvantage** | Best use |
+| Strategy | Advantage | Disadvantage | **How to mitigate the disadvantage** | Typical use |
 |---|---|---|---|---|
-| **Cache-aside** | Simple; caches requested data | Cold misses, stale cached entries, stampede | **TTL + invalidate after DB commit + cache warming + single-flight loading** | Product catalog, profile GET |
-| **Read-through** | Centralized miss logic | Loader dependency, miss latency, possible DB overload | **Replicated cache + bounded timeouts + controlled DB fallback + preload hot keys** | Shared read abstractions |
-| **Write-through** | Cache updated in same write workflow; read-after-write easier | Higher write latency, partial DB/cache failures | **Durable DB commit; retry/invalidate failed cache update; idempotency and versioning** | Frequently updated/read values |
-| **Write-behind** | Fast writes; batching | Crash before flush can lose acknowledged changes | **Durable queue/WAL + replication + retries + DLQ + recovery/replay** (when queue-backed) | Delay-tolerant counters, telemetry |
-| **Write-around** | Avoids filling cache with rarely read writes | Next read misses; stale old entry possible | **Invalidate on DB commit, TTL; optionally preload hot keys** | Write-heavy, infrequently read data |
+| **Cache-aside** | Simple; loads only requested data | First-read latency; stale entries | TTL, invalidation on DB writes/commit, cache warming, single-flight | Product catalog, user profiles |
+| **Read-through** | Centralized read-loading logic | Loader dependency, miss latency | Replicated cache, bounded timeouts, fallback to DB, preload hot keys | Shared read caching |
+| **Write-through** | Cache and DB coordinated during writes | Higher write latency, partial-write risk | DB-first durable commit, retry or invalidate cache, idempotency | Frequently read/updated records |
+| **Write-behind** | Low write latency, possible batching | Data loss before DB persistence | Durable queue/WAL, replication, retries, DLQ, recovery/replay | Delay-tolerant telemetry/counters |
+| **Write-around** | Avoids caching rarely read writes | Later read misses; old keys stale | Invalidate on DB commit, TTL, optional warm hot keys | Write-heavy, low-read data |
 
-**Default for a customer-facing EKS/AKS API backed by RDS/Azure SQL:** **Cache-aside + managed Redis HA + TTL + invalidation + bounded timeouts + circuit breaker + rate-limited DB fallback.** For payment and inventory correctness, do not trust an arbitrary cached value as transactional authority.
+**Architect recommendation from our discussion:** For a typical EKS/AKS customer-facing API with RDS/Azure SQL, start with **cache-aside + Redis HA + TTL + invalidation + rate-limited DB fallback**. The database remains the source of truth; correctness-critical financial operations should not rely on arbitrarily stale cache values.
 
 ---
 
@@ -160,17 +202,11 @@ It specifies *when* to invalidate: after the DB transaction **successfully commi
 
 ```mermaid
 flowchart TD
-  A["Client updates product"]
-  B["Application updates database"]
-  C{"Transaction committed?"}
-  D["Delete old Redis key"]
-  E["Next GET: cache MISS"]
-  F["Read fresh DB value"]
-  G["Populate Redis"]
-  H["Rollback / return error"]
-  A --> B --> C
-  C -->|"Yes"| D --> E --> F --> G
-  C -->|"No"| H
+  A["Update DB"] --> B{"Commit OK?"}
+  B -->|No| C["Return error"]
+  B -->|Yes| D["Delete Redis key"]
+  D --> E["Next GET misses"]
+  E --> F["Load fresh DB value"]
 ```
 
 **Why not invalidate on a failed transaction?** The DB may have rolled back, creating a needless miss.
@@ -190,13 +226,11 @@ When many concurrent requests miss **the same key**, coordinate them so only one
 ### Diagram 5 — Cache stampede prevention
 
 ```mermaid
-flowchart LR
-  A["1,000 requests for one missing key"]
-  B["Per-key single-flight coordinator"]
-  C["1 database read"]
-  D["Populate cache"]
-  E["Share result"]
-  A --> B --> C --> D --> E
+flowchart TD
+  A["1,000 requests"] --> B["Same key missing"]
+  B --> C["Single-flight"]
+  C --> D["One DB fetch"]
+  D --> E["Share result"]
 ```
 
 **Without it:** 1,000 users might trigger 1,000 reads. **With it:** ideally one read *per coordination scope/key*.
@@ -256,26 +290,11 @@ For AWS, a common production approach is **Amazon ElastiCache for Redis/Valkey**
 
 ```mermaid
 flowchart TD
-  U["Customer"]
-  LB["Load Balancer"]
-  APP["EKS Application Pods"]
-  EP["Redis Primary Endpoint"]
-  DB[("RDS / Authoritative DB")]
-  U --> LB --> APP
-  APP -->|"Cache operations"| EP
-  APP -.->|"Controlled DB fallback"| DB
-  subgraph AZ1["Availability Zone A"]
-    P[("Redis Primary")]
-  end
-  subgraph AZ2["Availability Zone B"]
-    R1[("Redis Replica 1")]
-  end
-  subgraph AZ3["Availability Zone C"]
-    R2[("Redis Replica 2")]
-  end
-  EP --> P
-  P -.->|"Async replication"| R1
-  P -.->|"Async replication"| R2
+  A["EKS / AKS pods"] --> B["Redis endpoint"]
+  B --> C[("Primary, AZ-1")]
+  C -.-> D[("Replica, AZ-2")]
+  C -.-> E[("Replica, AZ-3")]
+  A -.-> F[("DB fallback")]
 ```
 
 **Deployment checklist:**
@@ -292,16 +311,11 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  A["Primary in AZ-A fails"]
-  B["ElastiCache detects failure"]
-  C["Healthy eligible replica selected"]
-  D["Replica promoted in another AZ"]
-  E["Primary endpoint follows new primary"]
-  F["Redis clients reconnect"]
-  G["Reads/writes resume"]
-  H["Replacement replica / resync"]
-  A --> B --> C --> D --> E --> F --> G
-  D --> H
+  A["Primary fails"] --> B["Detect failure"]
+  B --> C["Promote replica"]
+  C --> D["Endpoint updated"]
+  D --> E["Clients reconnect"]
+  E --> F["Cache service resumes"]
 ```
 
 **Failure impact:** Some cache operations and client connections fail during detection/promotion. Failover is not zero downtime or automatically zero data loss. Applications require reconnect/retry behavior.
@@ -310,17 +324,11 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  A["10,000 incoming requests/sec"]
-  B["Application pods"]
-  C[("Redis unavailable")]
-  D{"Fallback permitted?"}
-  E[("RDS / Azure SQL")]
-  F["Controlled response"]
-  G["429 / 503 / acceptable stale response"]
-  A --> B --> C
-  C -->|"Timeout quickly"| D
-  D -->|"Within DB capacity budget"| E --> F
-  D -->|"DB capacity exhausted"| G
+  A["Cache unavailable"] --> B["Timeout quickly"]
+  B --> C{"Fallback allowed?"}
+  C -->|Yes| D["Limited DB reads"]
+  C -->|No| E["429 / 503"]
+  D --> F["Serve response"]
 ```
 
 | Redis failure | Expected behavior | SRE/architect response |
@@ -339,18 +347,11 @@ For **self-managed** non-clustered Redis on VMs/Kubernetes, Sentinel can monitor
 
 ```mermaid
 flowchart TD
-  A["Redis-aware application client"]
-  S["3 Sentinel instances"]
-  P[("Redis Primary")]
-  R1[("Replica - AZ B")]
-  R2[("Replica - AZ C")]
-  A -->|"Discover current primary"| S
-  A -->|"Reads / writes"| P
-  S -.->|"Monitor / authorize failover"| P
-  S -.->|"Monitor"| R1
-  S -.->|"Monitor"| R2
-  P -->|"Replication"| R1
-  P -->|"Replication"| R2
+  A["App client"] --> B["Sentinel discovery"]
+  B --> C[("Redis primary")]
+  C -.-> D[("Replica 1")]
+  C -.-> E[("Replica 2")]
+  B -.-> F["Monitor / promote"]
 ```
 
 **Important:** Redis Sentinel and Redis Cluster are different: Sentinel is a failover/discovery system typically for non-sharded Redis; Redis Cluster shards data and also supports replication/failover per shard. Managed AWS/Azure cache options generally reduce the need to run Sentinel yourself.
@@ -369,16 +370,11 @@ A **durable queue** stores accepted work persistently for later workers. A **wri
 
 ```mermaid
 flowchart TD
-  A["Application"]
-  Q[("Durable Queue / Log")]
-  W["Background Worker"]
-  D[("Database")]
-  L[("Dead Letter Queue")]
-  A -->|"1. Persist command/event"| Q
-  Q -.->|"2. Durable acceptance acknowledgement"| A
-  Q -->|"3. Consume"| W
-  W -->|"4. Persist / commit"| D
-  W -.->|"Repeated processing failures"| L
+  A["Application"] --> B["Durable queue"]
+  B --> C["Ack accepted"]
+  B --> D["Worker"]
+  D --> E[("Database")]
+  D -.-> F["DLQ on failures"]
 ```
 
 **Important distinction:** This is a *durable asynchronous write pipeline*. Classic write-behind caching acknowledges a cache write before DB persistence. Redis alone is **not automatically equivalent** to a durable queue/WAL with end-to-end guaranteed acceptance; Redis AOF/replication/ack policy and failure model matter.
@@ -449,20 +445,11 @@ This sets a 5-minute expiry.
 
 ```mermaid
 flowchart TD
-  A["API p99 / 5xx spikes"]
-  B{"Redis health?"}
-  C["Check failover, endpoint, client reconnects"]
-  D{"DB fallback load safe?"}
-  E["Constrain fallback / rate limit"]
-  F["Check cache misses, evictions, hot keys"]
-  G["Restore cache and warm gradually"]
-  H["Verify API, Redis and DB metrics"]
-  A --> B
-  B -->|"Down / failover"| C --> D
-  B -->|"Healthy"| F --> D
-  D -->|"No"| E --> G
-  D -->|"Yes"| G
-  G --> H
+  A["API p99 / 5xx"] --> B["Check Redis"]
+  B --> C["Check DB pressure"]
+  C --> D["Limit fallback"]
+  D --> E["Restore / warm"]
+  E --> F["Verify metrics"]
 ```
 
 **Incident response:** identify customer impact -> check Redis node/endpoint events and cache client errors -> confirm DB safety -> allow managed failover or restore cache -> reconnect -> gradual warming -> validate hit ratio, p99, errors and DB load.
@@ -511,6 +498,30 @@ Cache can be stale. Alert/retry invalidation using CDC/outbox where required, us
 
 **Q. Should payments use write-behind?**  
 Not by default. Payment correctness normally needs durable, strongly controlled transaction semantics. If asynchronous processing is used, persist commands durably, apply idempotency and expose states clearly.
+
+---
+
+### Original caching Q&A — Complete set from the first explanation
+
+**Q. When should we not cache data?**
+
+When strong freshness or consistency is required and stale values would cause incorrect business decisions—for example, certain financial balances, payment authorization decisions, or rapidly changing inventory checks. Caching may still be used around these systems with carefully defined correctness rules.
+
+**Q. How do you update Redis when the database changes?**
+
+Use invalidation after a DB update, update the cache with the new value, or use a write-through design. For concurrent updates, consider versioned values and race conditions.
+
+**Q. Is Redis a primary database?**
+
+Redis can be a primary database in systems designed around its durability and data model, but in a typical Redis-plus-RDS cache-aside design, RDS remains the source of truth and Redis is treated as disposable cached data.
+
+**Q. What happens if a cached value is stale?**
+
+Users may see outdated information. Use appropriate TTL, invalidation and consistency controls. Critical writes should not rely solely on potentially stale cache values.
+
+**Q. Can caching be implemented across multiple AWS regions?**
+
+Yes. Each region can have its own cache close to application workloads. Plan invalidation, cache warming, regional failover and acceptable data staleness; ordinary Redis caches do not automatically become a strongly consistent global cache.
 
 ---
 
