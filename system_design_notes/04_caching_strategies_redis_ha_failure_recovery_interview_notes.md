@@ -15,7 +15,7 @@ Caching stores frequently used data in a faster layer to avoid repeated, expensi
 ### Diagram 1 — Cache-aside API with Redis
 
 ```mermaid
-
+  flowchart TD
   A["Client / Mobile App"]
   B["API Gateway / Load Balancer"]
   C["Application Pods - EKS / AKS"]
