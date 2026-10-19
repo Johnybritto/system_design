@@ -1081,3 +1081,468 @@ You should reconcile uncertain transactions using order IDs, idempotency records
 > Finally, I would validate database integrity and monitor the system for a defined observation period before declaring the incident resolved.
 
 ---
+
+## RPO vs RTO for RDS Multi-AZ
+
+### RTO and RPO for RDS Multi-AZ
+
+| Metric | Expected behavior | Your answer |
+|---|---|---|
+| **RTO** | Typically 60–120 seconds for RDS Multi-AZ DB instance failover | Correct estimate |
+| **RPO** | Zero for acknowledged, committed transactions during normal Multi-AZ failover | Needs correction |
+
+AWS confirms that Multi-AZ DB instances use synchronous replication and typically complete failover in 60–120 seconds, although complex recovery can take longer.
+
+### The important distinction
+
+**RPO is not dependent on application retry logic.**
+
+For RDS Multi-AZ with synchronous replication:
+
+- A transaction committed and acknowledged before failure should be preserved on the standby.
+- An uncommitted transaction can be rolled back.
+- A transaction whose commit acknowledgment was lost has an uncertain outcome and needs reconciliation.
+
+Retry logic helps the **application recover failed operations**, but it does not establish the database's RPO.
+
+### Database RTO versus application RTO
+
+| Time | Event | Detail |
+|---|---|---|
+| 0 sec | Primary database fails | Application database requests begin failing |
+| 90 sec | RDS failover completes | Standby promoted and database becomes available |
+| 110 sec | Applications reconnect | DNS, connection pools, and retries recover |
+| 130 sec | Application recovery verified | API traffic, latency, and errors return to normal |
+
+Illustrative timings, not guaranteed AWS recovery durations.
+
+Even if the database fails over in 90 seconds, the **end-to-end application RTO may be longer** because of DNS caching, connection pool recovery, retries, and health verification.
+
+### Your corrected interview answer
+
+> For Amazon RDS Multi-AZ, I would expect a typical database failover duration of around 60–120 seconds, although it could take longer.
+>
+> Database RPO is effectively zero for acknowledged, committed transactions because synchronous replication protects those writes during normal failover.
+>
+> However, in-flight transactions may fail, and transactions without a commit acknowledgment may need reconciliation.
+>
+> I would implement idempotent retry logic, connection pool recovery, and appropriate DNS caching to minimize application RTO.
+>
+> Finally, I would measure the actual end-to-end recovery time through failover testing rather than assuming the database failover duration equals application RTO.
+
+---
+
+## Final Apple SRE follow-up: RPO vs application recovery
+
+Assume the primary database fails at 10:00 AM.
+
+- RDS completes failover at 10:02 AM.
+- All committed database records are preserved.
+- 100 customer requests fail during those two minutes.
+- The application has no automatic retry mechanism.
+
+**Question:**
+
+"Can we still say the database has zero RPO even though 100 customer requests failed?"
+
+And what would you implement to ensure those customers can safely complete their operations after recovery?
+
+### Why your RPO answer is correct
+
+Even though 100 customer requests failed during failover, the database can still have **zero RPO for acknowledged, committed transactions** under normal RDS Multi-AZ failover.
+
+Remember:
+
+- **RPO:** How much committed database data we can afford to lose.
+- **RTO:** How long it takes to restore service.
+- **Failed requests:** Operations that may never have committed and require application-level recovery.
+
+Retry logic doesn't determine database RPO.
+
+### Your SQS suggestion is also valid
+
+You can use Amazon SQS to buffer operations that don't need an immediate synchronous database response.
+
+```mermaid
+flowchart TD
+    A["Client / Application<br/>Submit request with idempotency key"]
+    B["Amazon SQS<br/>Durably buffer accepted work during DB failure"]
+    C["EKS Worker Pods<br/>Consume, retry with backoff, process idempotently"]
+    D["RDS PostgreSQL<br/>Persist transaction after recovery"]
+    A --> B --> C --> D
+```
+
+If the database is unavailable, the workers can stop or defer processing while accepted messages remain in SQS, subject to retention limits.
+
+**Two important cautions:**
+
+- SQS is at-least-once delivery for standard queues, so consumers must be idempotent.
+- Requests that already failed before being durably queued cannot be recovered from SQS automatically. The client must retry or the application must have persisted them elsewhere.
+
+### Interview-ready answer
+
+> Yes, database RPO can remain zero even when 100 customer requests fail, because no acknowledged, committed database transactions were lost.
+>
+> To improve application resilience, I would implement idempotent retries with exponential backoff and jitter.
+>
+> For asynchronous operations, I could introduce SQS to buffer accepted requests while the database is unavailable. Worker pods would process the messages after recovery, and a dead-letter queue would handle repeatedly failing messages.
+>
+> I would monitor queue depth, message age, processing failures, and end-to-end transaction completion.
+
+---
+
+## Mock Interview — Follow-up Question 14: SQS and duplicate transactions
+
+You've implemented SQS to buffer customer orders during database failover.
+
+After recovery:
+
+1. SQS delivers Order 123 to Worker Pod A.
+2. Worker Pod A successfully writes Order 123 to PostgreSQL.
+3. Before deleting the message from SQS, Worker Pod A crashes.
+4. SQS makes the message available again, and Worker Pod B receives Order 123.
+
+**Question:**
+
+"How would you prevent Worker Pod B from creating a duplicate order in PostgreSQL?"
+
+Would you rely on SQS to prevent duplicates, or implement something at the application/database level?
+
+### What you got right
+
+- **Idempotency:** Prevent the same logical order from being processed twice.
+- **Transaction ID:** Use a unique identifier to identify whether an order was already processed.
+- **Commit verification:** Check PostgreSQL before deciding whether to perform the operation again.
+- **Data reconciliation:** Useful if the system discovers missing, conflicting, or inconsistent records.
+
+One correction: **data reconciliation isn't necessary every time a duplicate SQS message arrives.**
+
+If Order 123 was already committed successfully, Worker B should identify the existing result and avoid inserting it again.
+
+### How duplicate prevention works
+
+```mermaid
+flowchart TD
+    A["SQS redelivers Order 123"]
+    B["Worker Pod B<br/>Processes stable idempotency key: order-123"]
+    C{"Does the order already exist?"}
+    D["YES<br/>Skip duplicate<br/>Acknowledge/delete SQS message"]
+    E["NO<br/>Create order<br/>Commit, then delete SQS message"]
+    A --> B --> C
+    C -->|"YES"| D
+    C -->|"NO"| E
+```
+
+**Important:** A database uniqueness constraint must enforce idempotency atomically. A simple check followed by an insert isn't enough, because two workers might check simultaneously and both attempt insertion.
+
+### SQL implementation — Simple example
+
+Assume `order_id` has a unique constraint or is the primary key.
+
+```sql
+INSERT INTO orders (order_id, amount)
+VALUES ('order-123', 5000)
+ON CONFLICT (order_id) DO NOTHING;
+```
+
+If Worker A has already committed `order-123`, Worker B's insert won't create another row. PostgreSQL handles the uniqueness conflict atomically.
+
+Worker B should then verify that the existing order represents the same logical request before acknowledging the SQS message.
+
+**Important:** Prefer the application's stable `order_id` or idempotency key over relying only on the SQS-generated `MessageId`. Two separate SQS messages might represent the same business operation.
+
+Also, preventing duplicate order inserts doesn't automatically prevent duplicate charges at an external payment provider. That operation needs its own idempotency protection.
+
+### Your improved interview answer
+
+> I would implement idempotency using a unique order ID or transaction ID.
+>
+> When Worker B receives a duplicate message, it should check whether the order was already processed.
+>
+> I would enforce uniqueness in PostgreSQL so that even concurrent workers cannot insert duplicate orders.
+>
+> If the original transaction was committed, Worker B should acknowledge the message without repeating the operation.
+>
+> If the transaction wasn't committed, it can retry safely. If the outcome is uncertain, the application must verify it before retrying.
+
+---
+
+## Mock Interview — Follow-up Question 15: Concurrent workers
+
+Consider a slightly different situation.
+
+Two EKS worker pods receive messages for the same Order 123 almost simultaneously.
+
+| Worker A | Worker B |
+|---|---|
+| Checks PostgreSQL for Order 123. | Checks PostgreSQL for Order 123. |
+| Not found | Not found |
+
+Both workers now attempt to insert Order 123.
+
+**Question:**
+
+"If both workers checked the database and found that the order didn't exist, how would you prevent them from creating duplicate records?"
+
+Would checking the database first be sufficient, or would you need another mechanism?
+
+### What is happening here?
+
+Two workers are processing the same order at almost the same time.
+
+| Time | Worker A | Worker B |
+|---|---|---|
+| 10:00:01 | Checks Order 123 | Checks Order 123 |
+| 10:00:02 | Not found | Not found |
+| 10:00:03 | Attempts INSERT | Attempts INSERT |
+| 10:00:04 | Successfully inserts | Could also insert if no uniqueness constraint exists |
+
+This problem is called a **race condition**.
+
+Both workers checked before either had committed the order.
+
+**Important:** Checking whether a record exists before inserting is not sufficient to prevent duplicates.
+
+### How do we fix it in PostgreSQL?
+
+**Step 1 — Enforce uniqueness**
+
+```sql
+CREATE TABLE orders (
+    order_id VARCHAR(50) PRIMARY KEY,
+    amount DECIMAL(10,2)
+);
+```
+
+Since `order_id` is the primary key, PostgreSQL will not allow two rows with the same order ID.
+
+**Step 2 — Use an atomic INSERT**
+
+Both workers execute:
+
+```sql
+INSERT INTO orders (order_id, amount)
+VALUES ('order-123', 5000)
+ON CONFLICT (order_id) DO NOTHING;
+```
+
+Now PostgreSQL handles the conflict.
+
+```mermaid
+flowchart TD
+    A["Worker A<br/>INSERT order-123"]
+    B["Worker B<br/>INSERT order-123"]
+    C["PostgreSQL<br/>PRIMARY KEY (order_id)"]
+    D["Worker A<br/>Insert succeeds and commits"]
+    E["Worker B<br/>Conflicting insert skipped"]
+    A --> C
+    B --> C
+    C --> D
+    C --> E
+```
+
+Assuming Worker A commits successfully. Worker B may wait for A's transaction outcome before resolving the conflict.
+
+Now the database contains only one Order 123.
+
+Worker B must verify that the existing order represents the same request before acknowledging its SQS message. If the order details conflict, it should raise an error for investigation.
+
+### What does atomic mean?
+
+Atomic means that an operation has an all-or-nothing outcome, rather than leaving partially applied changes.
+
+Here, PostgreSQL's uniqueness enforcement and `ON CONFLICT` handling safely resolve competing inserts, even when multiple workers execute concurrently.
+
+We don't need to implement a separate application-side distributed lock simply to prevent duplicate order IDs.
+
+### Interview-ready answer
+
+> This is a race condition because both workers check the database before either has inserted the record.
+>
+> To prevent duplicates, I would enforce a unique constraint on the order ID or idempotency key and use an atomic insert with `ON CONFLICT`.
+>
+> PostgreSQL will allow only one conflicting record to be inserted. The second worker can identify that the order already exists and avoid repeating the operation.
+>
+> After confirming the existing order matches the request, the worker can acknowledge the SQS message.
+
+### Quick follow-up
+
+Two worker pods attempt to insert the same Order 123.
+
+PostgreSQL has a `PRIMARY KEY` constraint on `order_id`, and both workers use `ON CONFLICT DO NOTHING`.
+
+**What happens when Worker B tries to insert Order 123 after Worker A has successfully committed it?**
+
+- A. PostgreSQL creates a second copy.
+- B. PostgreSQL skips the conflicting insert.
+- C. PostgreSQL automatically restarts Worker B.
+
+Your answer **A is incorrect. The correct answer is B.**
+
+### Why does PostgreSQL skip the duplicate?
+
+We have two workers:
+
+- Worker A inserts Order 123 and commits successfully.
+- Worker B attempts to insert the same Order 123.
+- PostgreSQL has a `PRIMARY KEY` constraint on `order_id`.
+
+Both use:
+
+```sql
+INSERT INTO orders (order_id, amount)
+VALUES (123, 5000)
+ON CONFLICT (order_id) DO NOTHING;
+```
+
+Since Order 123 already exists, PostgreSQL **skips Worker B's insert** without creating another row.
+
+| Worker | Result |
+|---|---|
+| A | Order 123 inserted |
+| B | Duplicate insert skipped |
+| Database | Exactly one row for Order 123 |
+
+Remember:
+
+- `PRIMARY KEY` prevents duplicate IDs.
+- `ON CONFLICT DO NOTHING` handles the conflict without raising a duplicate-key error.
+- Together, they make duplicate inserts safe, provided the existing record is checked for consistency.
+
+This does not automatically make external payment processing idempotent.
+
+---
+
+## Mock Interview — Question 16: Transaction atomicity
+
+Your application processes a payment using PostgreSQL.
+
+A transaction contains three operations:
+
+1. **Step 1 — Create Order 123** — INSERT into orders — Successful
+2. **Step 2 — Update account balance** — UPDATE accounts — Successful
+3. **Step 3 — Record payment** — INSERT into payments — Failed
+
+All three statements are part of **one database transaction**, and no `COMMIT` has happened yet.
+
+**Interviewer asks:**
+
+"The first two SQL statements succeeded, but the third failed. What happens to the order and the account balance?"
+
+"Would PostgreSQL keep the successful changes, or roll everything back?"
+
+### Correct! 10/10
+
+Exactly. **Atomicity means all or nothing.**
+
+If all three operations belong to one database transaction and the third operation fails before `COMMIT`, the transaction cannot be committed normally in PostgreSQL.
+
+| Operation | Execution result | Final result after rollback |
+|---|---|---|
+| INSERT Order 123 | Successful | Rolled back |
+| UPDATE account balance | Successful | Rolled back |
+| INSERT payment | Failed | Not applied |
+
+### How PostgreSQL handles this
+
+```sql
+BEGIN;
+
+INSERT INTO orders ...;     -- Success
+UPDATE accounts ...;       -- Success
+INSERT INTO payments ...;   -- Error
+
+ROLLBACK;
+```
+
+**Important:** In PostgreSQL, an SQL error normally leaves the transaction in an aborted state. The application must issue `ROLLBACK` (or roll back to a suitable savepoint) before continuing.
+
+This is why applications should handle transaction exceptions and ensure connections are cleaned up before returning them to the pool.
+
+---
+
+## Mock Interview — Question 17: Failed transaction and connection pooling
+
+Your application uses PostgreSQL and a connection pool containing 20 connections.
+
+A payment transaction fails midway.
+
+However, the application developer forgot to execute `ROLLBACK`.
+
+The application then tries to execute another SQL query using the same connection.
+
+PostgreSQL returns:
+
+```text
+ERROR: current transaction is aborted,
+commands ignored until end of
+transaction block
+
+SQLSTATE: 25P02
+```
+
+**Question:**
+
+As an SRE, what would you do?
+
+1. Would you restart the PostgreSQL database?
+2. Would you restart the application pods?
+3. Or would you handle the failed transaction and connection differently?
+
+### What does SQLSTATE 25P02 mean?
+
+Imagine your application has borrowed a database connection from a pool.
+
+It starts a transaction containing three SQL statements:
+
+```sql
+BEGIN;
+
+INSERT INTO orders VALUES (123, 5000);
+
+INSERT INTO payments VALUES (123, 5000);
+-- This statement fails
+
+SELECT * FROM orders WHERE order_id = 123;
+-- ERROR: 25P02
+```
+
+**What happened?**
+
+The second statement failed, but the application did not execute `ROLLBACK`.
+
+PostgreSQL marks that transaction as aborted and rejects subsequent ordinary SQL statements until the transaction is rolled back.
+
+```mermaid
+flowchart TD
+    A["Connection borrowed from pool"] --> B["SQL transaction fails<br/>Transaction enters aborted state"]
+    B --> C["SQLSTATE 25P02<br/>Further queries fail until rollback"]
+    C --> D["ROLLBACK<br/>Discard the failed transaction's changes"]
+    D --> E["Connection ready for reuse"]
+```
+
+### How would you troubleshoot and recover?
+
+| Step | SRE action |
+|---|---|
+| 1. Investigate | Find the original SQL error preceding `25P02` in application logs |
+| 2. Recover | Ensure the application executes `ROLLBACK` on the failed transaction |
+| 3. Connection pool | Return only clean connections; discard connections that cannot be reset safely |
+| 4. Prevent | Ensure application exception handling always performs transaction cleanup |
+| 5. Verify | Monitor SQL errors, connection pool utilization, and transaction duration |
+
+A properly configured connection pool such as HikariCP includes rollback and connection-cleanup behavior, but the application should still explicitly manage transactions correctly.
+
+### Interview-ready answer
+
+> SQLSTATE 25P02 indicates that a transaction has failed and PostgreSQL is rejecting further statements in that transaction.
+>
+> I would investigate the original SQL error, ensure the application rolls back the failed transaction, and verify that the connection is clean before returning it to the pool.
+>
+> I would not immediately restart the database or all application pods.
+>
+> If the connection cannot be recovered, I would discard it and allow the pool to replace it safely.
+
+**Remember:** Failed transaction → ROLLBACK → Clean connection → Reuse.
+
+---
