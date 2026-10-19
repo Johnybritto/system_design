@@ -1546,3 +1546,488 @@ A properly configured connection pool such as HikariCP includes rollback and con
 **Remember:** Failed transaction → ROLLBACK → Clean connection → Reuse.
 
 ---
+
+## Mock Interview — Question 18: PostgreSQL lock troubleshooting
+
+You're the on-call SRE. Customers are reporting that order updates are taking 30 seconds.
+
+You check PostgreSQL and find:
+
+```text
+PID  State                  Wait
+101  idle in transaction    -
+102  active                 Lock
+103  active                 Lock
+104  active                 Lock
+```
+
+Further investigation confirms that PID 101 is blocking the other three transactions.
+
+PID 101 has been idle in an open transaction for 15 minutes.
+
+**Interviewer asks:**
+
+"You've identified PID 101 as the blocking session. How would you safely resolve the issue without restarting PostgreSQL?"
+
+Would you:
+
+- A. Immediately restart PostgreSQL.
+- B. Identify the session owner, confirm whether the transaction can be rolled back, and terminate the blocking session if necessary.
+- C. Increase the database connection pool size.
+- D. Restart all application pods.
+
+### Correct! Answer B — 10/10
+
+That's the safest approach for a production database. We should identify the blocking session, confirm its impact, coordinate with the application owner, and terminate it only if necessary.
+
+You don't need to restart PostgreSQL or all the application pods.
+
+### PostgreSQL commands to remember
+
+For the Apple SRE interview, focus on these four operations.
+
+#### Step 1 — Check transaction state
+
+```sql
+SELECT pid, state, wait_event_type,
+       now() - xact_start AS transaction_age,
+       query
+FROM pg_stat_activity
+WHERE pid = 101;
+```
+
+Example output:
+
+```text
+pid:              101
+state:            idle in transaction
+transaction_age:  00:15:00
+query:            UPDATE orders ...
+```
+
+This indicates that PID 101 has an open transaction, but is not currently executing SQL. The displayed query is its most recently executed statement, not necessarily the statement responsible for every lock it holds.
+
+#### Step 2 — Find which sessions are blocked
+
+```sql
+SELECT pid,
+       pg_blocking_pids(pid) AS blocked_by,
+       wait_event_type,
+       query
+FROM pg_stat_activity
+WHERE wait_event_type = 'Lock';
+```
+
+Illustrative result:
+
+| PID | Blocked by |
+|---|---|
+| 102 | `{101}` |
+| 103 | `{101}` |
+| 104 | `{101}` |
+
+We can now see that PID 101 is blocking three other sessions.
+
+#### Step 3 — Check database locks
+
+```sql
+SELECT pid, locktype, mode,
+       relation::regclass AS relation,
+       granted
+FROM pg_locks
+WHERE pid IN (101, 102, 103, 104);
+```
+
+- `granted = true` means the lock has been acquired.
+- `granted = false` means the session is waiting to acquire it.
+
+`pg_locks` gives additional details about the locks, while `pg_blocking_pids()` is generally the better tool for identifying blocking sessions.
+
+#### Step 4 — Recover safely
+
+First, identify the owner of PID 101 using its application name, username, and client address. Ask the owning application to commit or roll back the transaction normally.
+
+If the transaction is abandoned and termination is approved:
+
+```sql
+SELECT pg_terminate_backend(101);
+```
+
+This terminates the session, rolls back its uncommitted transaction, and releases its transaction locks.
+
+**Important distinction:**
+
+| Command | What it does |
+|---|---|
+| `pg_cancel_backend(101)` | Cancels the currently executing query; doesn't necessarily end the transaction |
+| `pg_terminate_backend(101)` | Terminates the database session and rolls back its open transaction |
+
+Because PID 101 is *idle in transaction*, canceling its current query is not useful. The application should issue `ROLLBACK`, or the session can be terminated when justified.
+
+### Interview-ready answer
+
+> I would use `pg_stat_activity` to identify the long-running transaction and `pg_blocking_pids()` to determine which sessions are blocked.
+>
+> Then I would inspect `pg_locks` and identify the application responsible for the blocking transaction.
+>
+> If the transaction is abandoned, I would coordinate with the application team to roll it back, or terminate the blocking backend with approval.
+>
+> Finally, I would verify that blocked queries are progressing, API latency has recovered, and no abnormal lock waits remain.
+>
+> To prevent recurrence, I would investigate application transaction handling, keep transactions short, and consider an appropriate idle-in-transaction timeout.
+
+---
+
+## Mock Interview — Question 19: Recovery verification
+
+We have successfully performed point-in-time recovery and restored missing customer orders into the production database.
+
+The database is healthy and the application is functioning normally.
+
+However, we now have these numbers:
+
+| Expected recovered orders | Actually recovered |
+|---|---|
+| 2,000,000 | 1,995,000 |
+
+**5,000 orders are still missing.**
+
+The application team says:
+
+"All APIs are working. Can we close the incident?"
+
+**Interviewer asks:**
+
+"How would you identify exactly which 5,000 orders are missing, and how would you recover them without affecting existing production orders?"
+
+### What you got right
+
+| Your answer | Assessment |
+|---|---|
+| Compare expected and actual counts | Correct |
+| Check duplicate order IDs | Correct |
+| Identify exactly which rows are missing | Correct |
+| Restore only missing records | Correct approach |
+| Restore into the recovered database | Should be production |
+
+### How to identify the 5,000 missing orders
+
+Assume we've imported the expected recovery records into a staging table called `orders_recovery_stage`.
+
+We compare those IDs with the production `orders` table.
+
+```sql
+SELECT r.order_id
+FROM orders_recovery_stage r
+LEFT JOIN orders p
+    ON r.order_id = p.order_id
+WHERE p.order_id IS NULL;
+```
+
+**Simple explanation:**
+
+- `orders_recovery_stage` contains the orders we expect to recover.
+- `orders` contains the current production records.
+- `LEFT JOIN` compares the two datasets.
+- `WHERE p.order_id IS NULL` returns IDs missing from production.
+
+This should identify our 5,000 missing orders, assuming the expected recovery set is accurate.
+
+### How to recover them safely
+
+After validating that these are genuinely missing orders, we can use a controlled insert.
+
+```sql
+INSERT INTO orders (
+    order_id, customer_id, amount
+)
+SELECT r.order_id, r.customer_id, r.amount
+FROM orders_recovery_stage r
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM orders p
+    WHERE p.order_id = r.order_id
+)
+ON CONFLICT (order_id) DO NOTHING;
+```
+
+`ON CONFLICT` prevents a duplicate primary-key insert when a matching record already exists.
+
+For production, I'd first test the recovery, verify related customer/payment records, check for newer changes, and insert in controlled batches. Any conflicts or skipped records must be reconciled, and we must avoid unintended application side effects from triggers or downstream integrations.
+
+### Your improved interview answer
+
+> I would first compare the expected recovery count with the actual recovered records.
+>
+> Then I would compare the unique order IDs from the PITR recovery dataset against production using a SQL JOIN to identify exactly which records are missing.
+>
+> Once identified, I would verify those records are valid and restore them into production in controlled batches, without overwriting existing orders.
+>
+> Finally, I would check record counts, duplicates, foreign-key relationships, financial totals, and newer customer transactions before declaring recovery complete.
+
+---
+
+## Mock Interview — Question 20: PostgreSQL EXPLAIN
+
+Your PostgreSQL database contains 20 million order records.
+
+A customer-facing API is taking 5 seconds to respond.
+
+The application executes:
+
+```sql
+SELECT *
+FROM orders
+WHERE customer_id = 12345;
+```
+
+You run `EXPLAIN` and receive:
+
+```text
+Seq Scan on orders
+  (cost=0.00..450000.00 rows=1000 width=100)
+  Filter: (customer_id = 12345)
+```
+
+**Database observations**
+
+- CPU utilization: **85%**
+- Table rows: **20 million**
+- Query execution plan: **Sequential Scan**
+
+**Interviewer asks:**
+
+"What does a Sequential Scan mean, and why might it make this query slow?"
+
+"What would you investigate before deciding to create an index?"
+
+### What is a Sequential Scan?
+
+A **Sequential Scan (Seq Scan)** means PostgreSQL reads through the table to find rows matching the condition.
+
+For example:
+
+```sql
+SELECT * FROM orders
+WHERE customer_id = 12345;
+```
+
+If the table contains 20 million rows, PostgreSQL may need to examine all 20 million rows.
+
+This can cause high CPU, disk I/O, and slow queries.
+
+### Sequential Scan vs Index Scan
+
+| Sequential Scan | Index Scan |
+|---|---|
+| Scans the table | Uses an index to find matching records |
+| Potentially reads millions of rows | Can avoid reading unrelated rows |
+| Can be slow for selective queries | Usually faster when few rows match |
+| Useful when retrieving a large percentage of the table | Useful when retrieving a small percentage |
+
+**Important:** A Sequential Scan is not always bad. PostgreSQL may deliberately choose it when most rows are needed.
+
+### What should you investigate?
+
+Three commands to remember:
+
+**Check the execution plan:**
+
+```sql
+EXPLAIN
+SELECT * FROM orders
+WHERE customer_id = 12345;
+```
+
+**Check whether indexes exist:**
+
+```sql
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE tablename = 'orders';
+```
+
+**Check actual execution time:**
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders
+WHERE customer_id = 12345;
+```
+
+`EXPLAIN ANALYZE` actually executes the query. It reports actual execution time, rows processed, and buffer usage, so use it carefully in production.
+
+### How do we fix it?
+
+If `customer_id` has no suitable index and the query is selective:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_customer_id
+ON orders(customer_id);
+```
+
+Do this only after evaluating production load and the index's write/storage overhead.
+
+### Interview-ready answer
+
+> A Sequential Scan means PostgreSQL reads through the table to find matching rows. On a 20-million-row table, this can be expensive.
+>
+> I would check the execution plan, verify existing indexes, and compare estimated versus actual rows and execution time.
+>
+> If the query is selective and a suitable index is missing, I would consider creating one concurrently after stabilizing production.
+>
+> Finally, I would verify the execution plan and confirm that query latency and database resource usage have improved.
+
+**Remember:**
+
+`Seq Scan → Check indexes → EXPLAIN ANALYZE → Optimize → Verify`
+
+### Quick follow-up: EXPLAIN vs EXPLAIN ANALYZE
+
+**Interviewer:** What is the difference between `EXPLAIN` and `EXPLAIN ANALYZE`?
+
+- A. Both execute the query and show actual execution time.
+- B. EXPLAIN shows the estimated execution plan; EXPLAIN ANALYZE executes the query and shows actual statistics.
+- C. EXPLAIN creates an index automatically.
+
+**Correct! Answer B — 10/10**
+
+| Command | What it does |
+|---|---|
+| `EXPLAIN` | Shows the estimated execution plan without executing the query |
+| `EXPLAIN ANALYZE` | Executes the query and shows actual execution time, rows processed, and other statistics |
+
+**Interview tip:** Use `EXPLAIN ANALYZE` carefully in production because it actually executes the query.
+
+---
+
+## Final Topic: PITR and WAL — Quick Explanation
+
+### What is WAL?
+
+**WAL = Write-Ahead Log.**
+
+In PostgreSQL, WAL records database changes before the corresponding modified data pages are written to disk.
+
+Think of it as a transaction journal that helps PostgreSQL recover after crashes.
+
+For example:
+
+```text
+Customer places Order 123
+         ↓
+PostgreSQL records changes in WAL
+         ↓
+Transaction commits
+         ↓
+Modified database pages are persisted
+```
+
+WAL helps PostgreSQL recover committed changes even if a crash occurs before modified data pages are written.
+
+### How PITR uses WAL
+
+PITR = **Point-in-Time Recovery**.
+
+Suppose:
+
+- 10:00 AM — Database backup exists.
+- 10:05 AM — Developer accidentally deletes 2 million orders.
+- 10:20 AM — SRE discovers the issue.
+
+We want to restore the database to a safe point just before the deletion.
+
+```mermaid
+flowchart TD
+    A["Base backup — 10:00 AM"]
+    B["Replay archived WAL changes<br/>Reconstruct the database up to the selected time"]
+    C["Stop before the DELETE transaction<br/>Recovery point: ~10:04 AM"]
+    D["New restored RDS instance<br/>Deleted orders are present"]
+    A --> B --> C --> D
+```
+
+PostgreSQL uses a base backup and WAL replay to reconstruct an earlier database state.
+
+For Amazon RDS, the key points are:
+
+- PITR restores to a **new RDS instance**, not over the existing production database.
+- The recovery point must fall within the available restore window.
+- RDS uploads transaction logs approximately every five minutes; check `LatestRestorableTime` to determine the latest available recovery point.
+
+### Interview-ready answer
+
+> PostgreSQL uses Write-Ahead Logs to record changes before modified database pages are written.
+>
+> During PITR, a base backup is restored and WAL records are replayed until the selected recovery point.
+>
+> On Amazon RDS, this creates a new database instance. We can then extract missing records and reconcile them with production without overwriting newer transactions.
+
+### Final mock interview question — PITR
+
+A developer accidentally deletes 2 million orders at 10:05 AM.
+
+You restore the database using PITR to 10:04 AM.
+
+Meanwhile, production has accepted 50,000 new orders.
+
+**Question:** What happens to the 50,000 new orders if you redirect application traffic directly to the restored database?
+
+- A. WAL automatically merges all 50,000 new orders.
+- B. The restored database won't contain those newer orders. We need data reconciliation to preserve both sets.
+- C. RDS automatically synchronizes the restored database with production.
+
+**Correct! Answer B — 10/10**
+
+The PITR-restored database contains the 2 million deleted orders, but not the 50,000 newer orders.
+
+**Correct recovery:** Keep production running, extract the missing records from the restored database, reconcile them into production, and verify data integrity.
+
+---
+
+# Final Assessment — Database Troubleshooting & Recovery
+
+## Topic-by-topic status
+
+| Topic | Coverage | Your interview readiness |
+|---|---|---|
+| Slow queries, indexes, connection pools | Covered | Good |
+| Locks and deadlocks | Covered | Good, commands need revision |
+| PITR and WAL | Covered | Good conceptual understanding |
+| Failover and in-flight transactions | Covered | Stronger area |
+| Data integrity and reconciliation | Covered | More practice needed |
+
+## Remaining gaps — Prioritized
+
+| Priority | Gap | What to prepare |
+|---|---|---|
+| P0 | **Practical PostgreSQL troubleshooting** | Independently interpret `pg_stat_activity`, `pg_locks`, and `EXPLAIN ANALYZE` outputs |
+| P0 | **Recovery verification SQL** | Identify missing rows, duplicate IDs, orphaned records, and inconsistent payment totals |
+| P1 | **Hands-on PITR operations** | RDS restore process, selecting recovery time, validating the restored instance |
+| P1 | **Advanced query optimization** | Execution-plan costs, estimated vs actual rows, indexes, table statistics, CPU vs I/O |
+
+These are refinements, not entirely new topics.
+
+## Key concepts you should remember
+
+| Failure scenario | Correct SRE response |
+|---|---|
+| Database CPU 90%, slow SQL | Check top queries, execution plan, indexes, locks and I/O |
+| Idle transaction holding locks | Find blocker, coordinate rollback or safe termination |
+| Deadlock | PostgreSQL aborts one transaction; retry safely |
+| Accidental DELETE | PITR to new instance and selective reconciliation |
+| RDS primary failure | Multi-AZ failover, reconnect, handle uncertain commits |
+| Connection storm | Limit pools, backoff with jitter, circuit breakers, RDS Proxy |
+| Duplicate order processing | Stable idempotency key, unique constraint, atomic insert |
+| Recovery completed | Verify counts, IDs, relationships, payments and new transactions |
+
+## My assessment for your Apple interview
+
+**You have covered the required database troubleshooting and recovery syllabus.** I would not spend another full preparation session repeating these concepts.
+
+Your strongest area is reasoning about availability, failover, database overload, and application recovery.
+
+Your weaker area is independently explaining the exact PostgreSQL investigation and reconciliation commands without hints.
+
+I recommend one final **15–20-minute practical drill** covering PostgreSQL diagnostics and data integrity, then move to the next item in your Apple preparation plan.
+
+**Final status: Conceptual coverage complete; practical revision pending.**
