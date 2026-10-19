@@ -363,3 +363,351 @@ Configure appropriate `idle_in_transaction_session_timeout`, investigate applica
 > A deadlock happens when two or more transactions hold locks that each other needs, so neither can proceed. PostgreSQL detects this automatically and aborts one transaction, allowing the others to continue. As an SRE, I would inspect PostgreSQL logs and blocking relationships, identify the conflicting SQL statements, and coordinate with developers to ensure consistent lock ordering and shorter transactions. The application should retry aborted transactions safely using idempotency and bounded backoff.
 
 ---
+
+## Mock Interview — Follow-up Question 5: Deadlock
+
+Two application instances are executing payment transactions simultaneously.
+
+| Transaction A | Transaction B |
+|---|---|
+| Locks Order 100 | Locks Payment 200 |
+| Waits for Payment 200 | Waits for Order 100 |
+
+```mermaid
+flowchart LR
+    A["Transaction A<br/>Holds Order 100<br/>Wants Payment 200"]
+    B["Transaction B<br/>Holds Payment 200<br/>Wants Order 100"]
+    A -->|"A waits for B"| B
+    B -->|"B waits for A"| A
+```
+
+**Questions:**
+
+1. What is happening here? Is this a normal database lock or a deadlock?
+2. Will PostgreSQL resolve this automatically, or do you need to manually terminate a transaction?
+3. How would you prevent this from happening repeatedly?
+
+### What is a database deadlock?
+
+Imagine two people:
+
+- **Transaction A** has locked Order 100 and wants Payment 200.
+- **Transaction B** has locked Payment 200 and wants Order 100.
+
+Neither can proceed because each is waiting for the other to release a lock.
+
+### Normal lock vs deadlock
+
+| Normal lock | Deadlock |
+|---|---|
+| Transaction A holds a lock; B waits | A waits for B, and B waits for A |
+| A can finish and release the lock | Neither can finish without intervention |
+| B can then continue | PostgreSQL automatically breaks the deadlock |
+
+### How PostgreSQL handles a deadlock
+
+**PostgreSQL automatically detects and resolves deadlocks.** It aborts one transaction, rolls back its changes, releases its locks, and allows the other transaction to proceed.
+
+Example:
+
+```mermaid
+flowchart TD
+    A["Deadlock detected"] --> B["PostgreSQL aborts Transaction B<br/>Error: 40P01 — deadlock_detected"]
+    B --> C["Transaction A — Can continue"]
+    B --> D["Transaction B — Rolled back; retry needed"]
+```
+
+The application can retry Transaction B from the beginning, using limited retries with backoff and jitter. For payments, retries must be idempotent so they don't trigger duplicate charges.
+
+### How do we prevent deadlocks?
+
+The most important technique is **consistent lock ordering**.
+
+For example, ensure both transactions acquire locks in the same order:
+
+1. Lock the Order row.
+2. Lock the Payment row.
+3. Perform updates.
+4. Commit promptly and release the locks.
+
+Also keep transactions short, monitor deadlock errors in PostgreSQL logs, and investigate repeated deadlocks.
+
+### Interview-ready answer
+
+> A deadlock happens when two or more transactions hold locks that each other needs, so neither can proceed. PostgreSQL detects this automatically and aborts one transaction, allowing the others to continue. As an SRE, I would inspect PostgreSQL logs and blocking relationships, identify the conflicting SQL statements, and coordinate with developers to ensure consistent lock ordering and shorter transactions. The application should retry aborted transactions safely using idempotency and bounded backoff.
+
+### Quick check before moving to PITR
+
+**Interviewer:**
+
+Transaction A and Transaction B enter a deadlock. PostgreSQL automatically aborts Transaction B.
+
+What happens to Transaction B's uncommitted database changes?
+
+- A. They remain saved in the database.
+- B. They are rolled back, and the transaction can be retried.
+- C. Both transactions are automatically aborted.
+
+**Correct! Answer B.**
+
+When PostgreSQL detects a deadlock, it aborts one transaction and **rolls back its uncommitted changes**. The other transaction can continue.
+
+The application can then retry the aborted transaction from the beginning, using bounded retries with backoff and jitter.
+
+**Remember for the interview:** In payment systems, retries must also be idempotent to prevent duplicate charges.
+
+---
+
+## Mock Interview — Scenario 3: Point-in-Time Recovery (PITR)
+
+You are managing an application running on AWS EKS with Amazon RDS PostgreSQL (Multi-AZ).
+
+At **10:05 AM**, a developer accidentally executes:
+
+```sql
+DELETE FROM orders
+WHERE created_at < '2026-10-01';
+```
+
+The statement is committed, deleting approximately 2 million valid order records.
+
+At **10:20 AM**, the application team discovers the issue and escalates to you.
+
+**Incident timeline**
+
+| Time | Event |
+|---|---|
+| 10:05 AM | Accidental deletion |
+| 10:20 AM | Issue detected — 15 minutes later |
+
+**Additional information:**
+
+- Database is healthy and accepting connections.
+- Automated RDS backups are enabled with 7-day retention.
+- Customers have continued placing new orders since 10:05 AM.
+- The application cannot afford to lose those new orders.
+
+Amazon RDS supports point-in-time recovery using automated backups and transaction logs, restoring into a new database instance.
+
+**Interviewer asks:**
+
+"How would you recover the 2 million accidentally deleted records without losing the new orders created after 10:05 AM?"
+
+Walk me through your recovery approach.
+
+### What you got right and what needs correction
+
+| Your answer | Assessment |
+|---|---|
+| Don't immediately replace production | Correct |
+| Continue accepting new orders | Good, if safe |
+| Restoring puts the existing database into lock mode | Incorrect for RDS PITR |
+| Restore during non-business hours | Not necessary to start PITR |
+
+**Important correction:** Amazon RDS PITR creates a **new database instance**. It does not lock, overwrite, or stop the existing production database.
+
+Therefore, we can begin restoring immediately while the production database continues receiving new orders.
+
+### How I would approach this scenario
+
+```mermaid
+flowchart TD
+    A["Production RDS — 10:20 AM<br/>2 million old orders deleted; new orders still arriving"]
+    A --> B["Production DB<br/>Continue accepting safe customer transactions"]
+    A --> C["PITR restored DB<br/>State from just before 10:05 AM"]
+    C --> D["Controlled data reconciliation<br/>Recover missing orders without overwriting newer transactions"]
+    D --> B
+```
+
+This is a **logical data recovery**, not a database failover.
+
+### The recovery steps
+
+1. **Contain the incident:** Stop the faulty deletion process and prevent further destructive changes. Preserve logs and record the incident timeline.
+2. **Start PITR immediately:** Restore to a verified safe time just before the accidental deletion committed, around 10:04:59 AM in our example.
+3. **Keep production running safely:** Allow unrelated new orders to continue, subject to consistency checks.
+4. **Recover missing records:** Compare the restored database with production and selectively restore the deleted orders, handling conflicts and related tables.
+5. **Verify data integrity:** Compare counts and order IDs, validate foreign keys and financial totals, and confirm new orders remain intact.
+
+### 60-second interview answer
+
+> I would not directly replace the production database because new customer orders have been committed after the accidental deletion. Instead, I would immediately initiate Amazon RDS PITR to a separate database instance, targeting a point just before the deletion.
+>
+> Production would continue handling safe customer transactions while the restore happens.
+>
+> Once the restored database is available, I would work with the database and application teams to identify the missing records, reconcile them into production in a controlled manner, and validate data integrity.
+>
+> This approach aims to recover the deleted records without losing newer transactions.
+
+---
+
+## Mock Interview — Follow-up Question 7: Restoring without losing new orders
+
+PITR has completed successfully. You now have two databases:
+
+| Restored RDS | Production RDS |
+|---|---|
+| 10:04 AM state | 10:20 AM state |
+| Contains the 2 million deleted orders. | Missing the 2 million old orders. |
+| Does not contain orders placed after the restore point. | Contains 50,000 new orders placed after 10:05 AM. |
+
+**Interviewer asks:**
+
+"Would you simply change the application database endpoint to the restored RDS instance?"
+
+"If not, how would you bring those 2 million missing orders back into production without losing the 50,000 new orders?"
+
+### Understand the problem in simple terms
+
+You have two databases:
+
+| | Restored RDS | Production RDS |
+|---|---|---|
+| 2 million old orders | Present | Deleted |
+| 50,000 new orders | Missing | Present |
+
+**Question: Can we simply switch the application's database endpoint to the restored database?**
+
+**Answer: No.** We would recover the old orders but lose access to the 50,000 new orders, along with other changes made after the restore point.
+
+Instead, we must **selectively copy the missing records from restored RDS into production RDS**, preserving the newer records.
+
+This process is called *data reconciliation*.
+
+### Recovery flow
+
+```mermaid
+flowchart TD
+    A["Restored RDS<br/>Identify the 2 million deleted orders"]
+    B["Staging table / controlled import<br/>Compare IDs against the live database"]
+    C["Reconciliation<br/>Restore only genuinely missing records; check conflicts and relationships"]
+    D["Production RDS<br/>Original and new orders preserved"]
+    A --> B --> C --> D
+```
+
+### How would we practically do this?
+
+Let's assume the `orders` table contains:
+
+```sql
+orders (
+    order_id,
+    customer_id,
+    amount,
+    created_at
+)
+```
+
+**Step 1 — Identify the deleted records.** Determine which records existed before the deletion and are missing from production. Export these from restored RDS.
+
+**Step 2 — Import into a staging table.** Use an approved, secured import process to create a temporary reconciliation dataset in production, such as `orders_recovery_stage`.
+
+**Step 3 — Compare before inserting.** For a simplified example where `order_id` is a unique, stable identifier:
+
+```sql
+SELECT r.*
+FROM orders_recovery_stage r
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM orders p
+    WHERE p.order_id = r.order_id
+);
+```
+
+This identifies candidate missing orders.
+
+**Step 4 — Restore carefully.** After validating the candidate records, insert in controlled batches. An `ON CONFLICT DO NOTHING` safeguard can avoid duplicate primary-key inserts, but conflicts must be investigated rather than silently ignored.
+
+**Step 5 — Verify.** Confirm the deleted orders have been recovered, the newer orders remain intact, and relationships with payments, customers, and other tables are consistent.
+
+In real systems, order IDs alone may not be enough. You must account for records that were legitimately deleted, updated, or recreated after the incident and for related tables and payment state.
+
+### One SQL example to remember
+
+After the missing records have been validated in the staging table:
+
+```sql
+INSERT INTO orders (
+    order_id, customer_id, amount, created_at
+)
+SELECT
+    r.order_id, r.customer_id,
+    r.amount, r.created_at
+FROM orders_recovery_stage r
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM orders p
+    WHERE p.order_id = r.order_id
+)
+ON CONFLICT (order_id) DO NOTHING;
+```
+
+This inserts missing orders and avoids overwriting orders with existing IDs. PostgreSQL supports `ON CONFLICT` for handling unique-key conflicts.
+
+This is a simplified illustration, not a complete production recovery procedure. Before executing it, we must validate the recovered records, related tables, triggers, business rules, and any primary-key sequence conflicts. We should test and execute the recovery in controlled transactions or batches and reconcile any skipped records.
+
+### Interview-ready answer
+
+> I would not switch the application endpoint directly to the restored database because we would lose access to newer orders.
+>
+> Instead, I would keep production running, extract the deleted records from the PITR-restored instance, and import them into a staging table.
+>
+> I would compare those records against production using their unique order IDs and restore only the genuinely missing records in controlled batches.
+>
+> Finally, I would verify record counts, payments, foreign-key relationships, and all new transactions to ensure no data has been lost or corrupted.
+
+---
+
+## Mock Interview — Follow-up Question 8: Data integrity
+
+You've restored the 2 million orders, and production is functioning normally.
+
+The application team reports that the API is healthy and there are no errors.
+
+But the engineering manager asks:
+
+**"How can you prove that the recovery was successful and that we didn't lose, duplicate, or corrupt any orders?"**
+
+What would you verify at the database and application levels?
+
+### Five important data-integrity checks
+
+| Check | Simple explanation | What we're verifying |
+|---|---|---|
+| **1. Record count** | Compare expected and actual number of orders | No missing records |
+| **2. Duplicate IDs** | Check that the same order ID doesn't appear twice | No duplicate orders |
+| **3. Data consistency** | Compare customer IDs, amounts, and order details against the recovery source | No corrupted or incorrect records |
+| **4. Foreign keys** | Verify orders still reference valid customers and related payment records | Relationships are intact |
+| **5. New transactions** | Confirm that all 50,000 newer orders remain | No recent data lost |
+
+### Let's apply this to our scenario
+
+We started with:
+
+- Old orders recovered: **2,000,000**
+- New orders preserved: **50,000**
+- Expected total across these two groups: **2,050,000**
+
+Assuming no other legitimate changes affected these records.
+
+But counting alone is insufficient.
+
+For example, suppose there are 2,050,000 records, but 500 old orders are missing and 500 unexpected records exist. The total count still matches!
+
+So we also compare **individual order IDs**, relevant field values, and financial totals.
+
+For payment applications, we'd reconcile payments with the payment provider or financial ledger to ensure we're not missing a transaction or counting it twice.
+
+### Interview-ready answer
+
+> After recovering the deleted records, I would first verify the total record count against our expected recovery dataset.
+>
+> Then I would check for missing or duplicate order IDs, compare important fields and financial totals, and verify referential integrity between orders, customers, and payments.
+>
+> I would specifically validate that the 50,000 new orders are still present and unchanged.
+>
+> Finally, I would run application-level tests, verify payment reconciliation, and monitor error rates and database metrics before declaring the incident resolved.
+
+**Remember these five words:** Count → Duplicates → Consistency → Relationships → New transactions.
+
+---
