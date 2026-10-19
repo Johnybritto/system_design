@@ -711,3 +711,373 @@ For payment applications, we'd reconcile payments with the payment provider or f
 **Remember these five words:** Count → Duplicates → Consistency → Relationships → New transactions.
 
 ---
+
+## Mock Interview — Scenario 4: Database failover and in-flight transactions
+
+Your application runs on EKS and uses Amazon RDS PostgreSQL with a Multi-AZ standby.
+
+The primary database suddenly fails while customer orders are being processed.
+
+```mermaid
+flowchart TD
+    A["EKS — Application Pods"]
+    B["Primary DB — AZ-A<br/>Failed"]
+    C["Standby DB — AZ-B<br/>Failover target"]
+    A --> B
+    B -.->|"Failover"| C
+```
+
+At the time of failure, three transactions were in progress:
+
+| Transaction | Status |
+|---|---|
+| A | Committed and acknowledged to application |
+| B | Executing, not yet committed |
+| C | Commit requested, but application did not receive confirmation |
+
+**Interviewer asks:**
+
+1. What happens to these three transactions when the primary fails?
+2. Will the standby database automatically take over?
+3. How should the application handle interrupted connections and retries?
+
+### What happens to the three transactions?
+
+| Transaction | What happens after failover? | Application action |
+|---|---|---|
+| **A — Committed and acknowledged** | Changes survive failover under normal RDS Multi-AZ durability guarantees | No retry required |
+| **B — Still executing** | The interrupted, uncommitted transaction is rolled back during recovery | Retry the entire transaction safely |
+| **C — Commit requested, no acknowledgement** | **Unknown outcome:** It may have committed, or it may have rolled back | Verify whether it committed before deciding how to retry |
+
+Amazon RDS Multi-AZ DB instances use synchronous replication to maintain a standby in another Availability Zone.
+
+### Why Transaction C is particularly important
+
+Suppose a customer places an order.
+
+```mermaid
+flowchart TD
+    A["Application sends COMMIT"] --> B["Database processes the request"]
+    B --> C["Primary database fails<br/>Application never receives confirmation"]
+    C --> D{"Was the order committed?"}
+    D --> E["The commit completed, but the acknowledgment was lost."]
+    D --> F["The database failed before the commit completed, so the transaction was rolled back."]
+```
+
+There are two possibilities:
+
+- The commit completed, but the acknowledgment was lost.
+- The database failed before the commit completed, so the transaction was rolled back.
+
+This is why **blindly retrying payment transactions is dangerous**.
+
+The application should reconnect, check the transaction using a unique order ID or idempotency key, and then decide whether to return the existing result or retry the operation.
+
+An idempotency key must be enforced by the application and database, such as through a unique constraint. Simply repeating the same message ID is not sufficient by itself.
+
+### Interview-ready answer
+
+> In an RDS Multi-AZ failover, Transaction A has already committed and been acknowledged, so its data should survive.
+>
+> Transaction B was still executing, so its uncommitted changes will be rolled back during recovery. The application needs to retry the entire transaction safely.
+>
+> Transaction C is more complicated because the commit was requested but the acknowledgment was lost. We cannot assume whether it committed or rolled back.
+>
+> After failover, the application should reconnect, verify the transaction status using its unique transaction ID, and retry only when appropriate. For payments, we must enforce idempotency to avoid duplicate charges.
+
+---
+
+## Mock Interview — Follow-up Question 10: Application connectivity after RDS failover
+
+Amazon RDS detects the primary failure and automatically promotes the standby database.
+
+The new primary is healthy and accepting connections.
+
+However, your EKS application pods are still reporting:
+
+```text
+SQLSTATE 08006
+Connection failure
+
+Connection timeout
+```
+
+Your architecture:
+
+```mermaid
+flowchart TD
+    A["EKS Application Pods<br/>Connection pool: 20 per pod"]
+    B["RDS Database Endpoint (DNS)<br/>mydb.xxxx.rds.amazonaws.com"]
+    C["AZ-A<br/>Old primary failed"]
+    D["AZ-B<br/>New primary healthy"]
+    A --> B
+    B -.->|"Old target"| C
+    B -->|"New target"| D
+```
+
+RDS updates the database endpoint's DNS target during failover. Applications must establish working connections to the new primary, and cached DNS information can delay recovery.
+
+**Interviewer asks:**
+
+"If the new database is healthy, why are application pods still failing to connect?"
+
+"What would you investigate and do to restore application connectivity without causing a connection storm?"
+
+### Why NetworkPolicy could be involved
+
+Suppose your NetworkPolicy restricts outgoing traffic from application pods.
+
+After failover, the RDS endpoint resolves to a different IP address. If your egress rules permit only the previous IP, connectivity could fail.
+
+However, if there was no NetworkPolicy change and the application uses the proper RDS endpoint, **stale database connections and DNS caching are more likely causes**.
+
+### What actually happens during failover?
+
+```mermaid
+flowchart TD
+    A["Application Pod<br/>Existing connection pool"]
+    B["RDS Endpoint<br/>mydb.xxxx.rds.amazonaws.com"]
+    C["Old Primary<br/>10.0.1.10<br/>Failed"]
+    D["New Primary<br/>10.0.2.20<br/>Healthy"]
+    A --> B
+    B -.-> C
+    B --> D
+```
+
+Illustrative IPs. The database endpoint changes its DNS target during failover.
+
+The application may continue failing because:
+
+1. **Stale connections:** The connection pool contains broken TCP connections to the old primary.
+2. **DNS caching:** The application continues resolving the endpoint to the old IP.
+3. **Retry storm:** Hundreds of pods simultaneously attempt reconnection, overwhelming the new primary.
+4. **Network restrictions:** NetworkPolicy, security groups, or routes prevent connections to the new primary.
+
+### How I would troubleshoot
+
+| Check | Action |
+|---|---|
+| DNS | Run `nslookup` or `dig` from an application pod; compare with the current RDS target |
+| Network | Test TCP connectivity to the RDS endpoint on port 5432 |
+| Connection pool | Check stale connections, validation failures, pool exhaustion |
+| Security | Verify NetworkPolicy, security groups and routes |
+| Recovery | Replace broken connections gradually, use bounded retries with jitter and monitor database connections |
+
+For Java-based applications, configuring an appropriate JVM DNS cache TTL is particularly important.
+
+### Interview-ready answer
+
+> First, I would verify that the RDS failover completed and the endpoint is resolving correctly from the application pods.
+>
+> Next, I would check whether the application connection pool is reusing stale connections established before failover.
+>
+> I would also verify NetworkPolicy, security groups, and connectivity to port 5432.
+>
+> To recover, I would ensure broken connections are discarded and new connections are established gradually with bounded exponential backoff and jitter, avoiding a connection storm.
+>
+> For longer-term improvement, I would evaluate RDS Proxy, which can reduce application disruption during database failover.
+
+RDS Proxy can maintain application-facing connections and automatically connect to the new primary, although in-flight transactions can still fail.
+
+---
+
+## Mock Interview — Follow-up Question 11: Application connection pools
+
+- DNS is resolving to the **new primary database** correctly.
+- NetworkPolicy and security groups are allowing traffic.
+- TCP connectivity on port 5432 is successful.
+- The database is healthy.
+
+But the application is still reporting connection errors.
+
+You discover that **50 application pods each have a connection pool containing 20 connections**, some of which were created before failover.
+
+**Question:**
+
+"What would you do with these connection pools? Would you restart all 50 application pods, increase the pool size, or take another approach?"
+
+Explain why.
+
+### How to recover the connection pools
+
+We have:
+
+| App pods | Pool size / pod | Max pooled connections |
+|---|---|---|
+| 50 | 20 | 1,000 |
+
+1,000 is the combined pool capacity, not necessarily the number of established database connections.
+
+### Recovery steps
+
+| Step | What I would do | Why |
+|---|---|---|
+| 1. Check logs | Identify broken connection errors and pool timeouts | Confirm the failure |
+| 2. Validate connections | Test connections before returning them to requests | Identify stale connections |
+| 3. Evict stale connections | Use the pool's connection eviction/reset mechanism | Remove connections to the old primary |
+| 4. Reconnect gradually | Apply capped pool sizes, backoff and jitter | Avoid a connection storm |
+| 5. Verify recovery | Check DB connections, API p99 and error rates | Confirm service recovery |
+
+If the application uses a connection pool such as HikariCP, its pool management facilities can help evict stale connections and create replacements.
+
+**Would I ever restart application pods?**
+
+Yes. If the application cannot recover its pool, I would consider a **controlled rolling restart**, keeping sufficient healthy pods available and staggering reconnections.
+
+I would not restart all 50 pods simultaneously.
+
+### Interview-ready answer
+
+> I would first inspect application logs and connection pool metrics to confirm whether the failures are caused by stale connections from the previous primary database.
+>
+> I would not immediately increase the pool size or restart all application pods, because that could generate a connection storm against the newly promoted primary.
+>
+> I would invalidate broken connections using the application's connection pool management mechanism and allow new connections to be established gradually, with bounded retries, exponential backoff, and jitter.
+>
+> If the pools cannot recover, I would consider a controlled rolling restart.
+>
+> Finally, I would monitor connection counts, database CPU, connection failures, and API latency to verify recovery.
+
+---
+
+## Mock Interview — Follow-up Question 12: Preventing connection storms
+
+The application teams have fixed the stale connection problem.
+
+All 50 application pods now attempt to establish new connections to the healthy database.
+
+Suddenly:
+
+| DB CPU | Connection attempts |
+|---|---|
+| 95% | 1,000 |
+
+Even though the failover succeeded, the database is becoming overloaded again.
+
+**Question:**
+
+"As the SRE, what mechanisms would you implement so that 50 application pods do not simultaneously overwhelm the database after every failover?"
+
+Consider **connection limits, retries, backoff with jitter, and RDS Proxy**.
+
+### What you got right
+
+| Mechanism | How it helps |
+|---|---|
+| **Rate limiting** | Reduces incoming application requests that generate database traffic |
+| **Backoff with jitter** | Prevents all 50 pods from retrying connections simultaneously |
+| **Circuit breaker** | Temporarily stops requests to an unhealthy database and allows limited recovery probes |
+
+These are all valid, but the interviewer is specifically asking about a **database connection storm**.
+
+You should therefore add two more important mechanisms: **connection pool limits and RDS Proxy**.
+
+### Complete architecture-level answer
+
+Imagine we have 50 application pods, each configured for 20 database connections.
+
+That's a potential 1,000 database connections.
+
+Instead of allowing all connections to be recreated immediately, we would:
+
+1. Configure bounded connection pool sizes and gradual connection creation.
+2. Use exponential backoff with jitter for failed connection attempts.
+3. Apply a circuit breaker so an unhealthy database isn't overwhelmed.
+4. Limit or shed noncritical incoming application traffic during recovery.
+5. Consider RDS Proxy to manage and reuse database connections more efficiently.
+
+One distinction: rate limiting application requests doesn't automatically limit connection establishment. The connection pool must have its own concurrency and connection-creation controls.
+
+### Where RDS Proxy fits
+
+```mermaid
+flowchart TD
+    A["50 EKS Application Pods<br/>Client connection pools"]
+    B["Amazon RDS Proxy<br/>Connection pooling • Reuse • Connection limits"]
+    C["RDS PostgreSQL — New Primary<br/>Controlled database connections"]
+    A --> B --> C
+```
+
+RDS Proxy can reuse backend database connections across application sessions, reducing connection churn. It also supports `MaxConnectionsPercent` to limit backend database connections.
+
+Two important limitations:
+
+- RDS Proxy doesn't eliminate excessive SQL workload or CPU pressure.
+- Certain PostgreSQL operations cause *session pinning*, reducing connection sharing.
+
+### Your improved interview answer
+
+> To prevent a connection storm after database failover, I would implement rate limiting, bounded exponential backoff with jitter, and circuit breakers.
+>
+> I would also limit the maximum connection pool size per application pod and make sure connections are recreated gradually.
+>
+> For better resilience, I would consider RDS Proxy to pool and reuse database connections and protect the database from excessive connection creation.
+>
+> Finally, I would monitor database connections, CPU, connection timeouts, and application latency to ensure the recovery is stable.
+
+---
+
+## Mock Interview — Final Recovery Verification Question
+
+We've successfully recovered from the RDS failover.
+
+- The new primary is healthy.
+- All EKS application pods have reconnected.
+- Database CPU is back to 40%.
+- API latency has returned to normal.
+
+Your manager asks:
+
+**"Can we now declare the incident resolved? How do we know that all customer transactions are safe?"**
+
+### Your answer versus the expected answer
+
+| Your answer | Assessment |
+|---|---|
+| Check application health and API latency | Correct |
+| Test sample database queries | Correct |
+| Verify database health | Correct |
+| Check traffic and request rates | Correct |
+| Check outstanding transactions | Good |
+| Reconcile failed or uncertain transactions | Missing |
+| Verify committed data integrity | Missing |
+
+### What you should add
+
+Remember our previous transaction example:
+
+| Transaction | Before failover | Recovery verification |
+|---|---|---|
+| A | Committed and acknowledged | Confirm the data is present |
+| B | Uncommitted | Confirm rollback; retry safely |
+| C | Commit requested, acknowledgment lost | Check whether it committed before retrying |
+
+**Transaction C is the most important.**
+
+If the customer paid ₹5,000 and the application lost the acknowledgment, blindly retrying could cause a duplicate payment unless idempotency is enforced.
+
+You should reconcile uncertain transactions using order IDs, idempotency records, and payment-provider records when applicable.
+
+### Final production recovery checklist
+
+- [ ] RDS failover completed; new primary is healthy
+- [ ] Application pods and connection pools have recovered
+- [ ] API latency, error rate, and traffic are normal
+- [ ] No abnormal lock waits, connection storms, or outstanding transactions
+- [ ] Committed and uncertain transactions have been reconciled
+- [ ] Data integrity, payment totals, and order counts are verified
+- [ ] Recovery remains stable during an observation window
+
+### Your improved interview answer
+
+> Once the RDS failover is complete, I would verify the database is healthy and all application pods have re-established connectivity.
+>
+> I would check API latency, error rates, database CPU, connection pool health, and outstanding transactions.
+>
+> Then I would verify committed transactions are present, ensure uncommitted transactions were handled correctly, and reconcile any transactions whose commit status is unknown.
+>
+> For payment operations, I would check idempotency records and payment-provider reconciliation to ensure there were no duplicate or missing payments.
+>
+> Finally, I would validate database integrity and monitor the system for a defined observation period before declaring the incident resolved.
+
+---
