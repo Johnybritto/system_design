@@ -107,7 +107,7 @@ flowchart TD
   Kafka --> Notify["Notifications / Audit / Analytics"]
   DB --> Reconcile["Reconciliation Workers"]
   Reconcile --> PSP
-  DB -. "Protected cross-region replication" .-> DR[("Warm DR Region")]
+  DB -.->|Protected cross-region replication| DR[("Warm DR Region")]
 ~~~
 
 ## Core components
