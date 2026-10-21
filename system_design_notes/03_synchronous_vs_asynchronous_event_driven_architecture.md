@@ -105,6 +105,8 @@ flowchart TD
 
 **Remember this line from the lecture:**
 
+Event-Driven Architecture (EDA) is a system design paradigm where decoupled components communicate asynchronously by producing, detecting, and reacting to events.
+
 > We decouple the components.
 
 Rather than requiring the backend to finish during the original HTTP call, place a durable queue between the producer and consumer. The queue **buffers messages** while consumers process them at their available rate.
