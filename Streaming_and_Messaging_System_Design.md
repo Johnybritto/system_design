@@ -107,6 +107,21 @@ For example, an analytics application that was down for 30 minutes can resume re
 
 Important distinction: **Streaming is a form of messaging.** These are not completely separate categories. Kafka can process tasks, while some messaging brokers also support publish/subscribe and event retention.
 
+### Fundamental differences — data lifecycle and processing
+
+The actual fundamental difference between the two lies in how the data is treated after it is read (destruction vs. persistence) and whether the data is processed as standalone tasks or a continuous history.
+
+Here is a direct comparison to clarify how they truly differ:
+
+| Attribute | Messaging Systems (e.g., RabbitMQ, SQS) | Streaming Systems (e.g., Apache Kafka, Kinesis) |
+|---|---|---|
+| Data Lifecycle | Destructive. Once a consumer reads and acknowledges a message, it is deleted from the queue. | Persistent. Data is appended to an immutable log and stays there for a set retention period, even after being read. |
+| Replayability | No. You cannot re-read or "rewind" to get past messages because they are gone. | Yes. Multiple consumers can re-read or replay historical data from any point in time. |
+| Data Nature | Discrete Commands / Tasks. Each message is an independent action item (e.g., "Generate PDF Report #402"). | Continuous Facts / Events. A continuous stream of related occurrences (e.g., sensor telemetry or GPS coordinates). |
+| Primary Goal | Task Delegation. Decoupling components and distributing a workload across workers. | Data Pipelines & Analytics. Tracking chronological history and analyzing data patterns over time. |
+
+*Scope note: The comparison describes common traditional queue vs. retained-log designs, rather than every product configuration. For SQS, successful processing usually requires an explicit delete after receipt; acknowledgement by itself is not the same API operation. Some messaging systems support replay, while Kafka/Kinesis replay is limited to the configured retention window.*
+
 ## 4. Components involved and their responsibilities
 
 | Component | Messaging | Streaming |
