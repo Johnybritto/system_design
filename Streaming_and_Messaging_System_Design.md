@@ -11,6 +11,8 @@ Here, streaming means **event streaming**, such as Apache Kafka, not video strea
 
 ## 1. Messaging — explained in layman's terms
 
+Messaging in system design is an asynchronous communication method where software components send data packets (messages) to each other through an intermediary broker or queue, rather than calling each other directly
+
 Imagine you're ordering food at a restaurant.
 
 You give your order to a waiter, who places it in the kitchen's order queue. A chef picks up the order, prepares the food, and marks it complete.
