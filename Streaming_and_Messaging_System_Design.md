@@ -46,6 +46,8 @@ This is messaging.
 
 ## 2. Streaming — explained in layman's terms
 
+Streaming in system design is the continuous ingestion, transport, and processing of data in real time as it is generated, rather than collecting and processing it in large, delayed batches
+
 Imagine a cricket match.
 
 Every ball generates an event:
