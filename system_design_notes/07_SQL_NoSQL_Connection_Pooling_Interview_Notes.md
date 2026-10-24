@@ -948,3 +948,37 @@ For **DynamoDB-like access-pattern modeling**, ask: *What is the partition key (
 > I would start by identifying the main entities from the functional requirements, then define their primary keys, foreign keys and relationships. I would choose a relational database when transactions and integrity are important, and design indexes based on the API queries, including composite indexes where they help. I would start with normalized data and denormalize selectively for high-volume read paths with clear consistency guarantees. Finally, I would estimate data growth and choose an appropriate partition or shard key only if required by scale.
 
 **Quick memory hook:** **Entities → Keys → Relationships → APIs/Indexes → Consistency → Scale**.
+
+---
+
+## Database — Quick Interview Revision (One-Liners)
+
+| Topic | One-line explanation |
+|---|---|
+| **Primary Key (PK)** | Uniquely identifies each row in a table. |
+| **Foreign Key (FK)** | Links a record to another table. |
+| **Unique Key** | Prevents duplicate values. |
+| **Composite Key** | Two or more columns together identify a record. |
+| **Index** | Speeds up data retrieval without scanning every row. |
+| **B-tree Index** | Keeps indexed values sorted for efficient searches and range queries. |
+| **Composite Index** | Index on multiple columns; column order matters. |
+| **Covering Index** | Contains all columns needed to answer a query without reading the table. |
+| **Clustered Index** | Determines how table rows are physically/logically organized, depending on the database. |
+| **Nonclustered Index** | Separate index structure pointing to table records. |
+| **Index Scan** | Uses an index to locate matching data. |
+| **Sequential Scan** | Reads the entire table to find matching data. |
+| **EXPLAIN ANALYZE** | Shows the actual execution plan and performance of a SQL query. |
+| **DynamoDB PK** | Determines how data is distributed and accessed. |
+| **DynamoDB SK** | Sorts items sharing the same partition key. |
+| **GSI** | Secondary index supporting queries using different partition/sort keys. |
+| **LSI** | Secondary index with the same partition key but a different sort key. |
+| **Hot Partition** | One partition receives excessive traffic and becomes a bottleneck. |
+| **Transaction Isolation** | Controls what concurrent transactions can see and how they interfere. |
+| **Row Locking** | Prevents conflicting changes to the same row. |
+| **Deadlock** | Transactions block each other while waiting for locks. |
+
+### Three interview rules to remember
+
+- **SQL:** Choose indexes based on \`WHERE\`, \`JOIN\` and \`ORDER BY\`.
+- **DynamoDB:** Choose PK/SK based on access patterns.
+- **Performance:** More indexes improve certain reads but increase write overhead.
