@@ -835,3 +835,217 @@ Identity + Encryption
 ```
 
 Then map those capabilities to AWS, Azure, or another cloud depending on the interview context.
+
+
+---
+
+# 19. YouTube System Design — Exact Upload, Chunking & Playback Flow
+
+There are **3 stages** to understand: uploading the original video in chunks, processing it into playable segments, and streaming those segments to viewers.
+
+## Stage 1 — User uploads a 1 GB video
+
+\`\`\`text
+User selects video (1 GB)
+          |
+          v
+       Client
+          |
+          v
+     API Gateway
+          |
+          v
+     Video Service
+          |
+          +----> Metadata DB
+          |      status = UPLOADING
+          |
+          +----> S3 InitiateMultipartUpload
+          |      Returns uploadId
+          |
+          v
+  Generate presigned URLs
+          |
+          v
+      Client splits
+    1 GB into chunks
+          |
+          v
+ Chunk 1 ─────────> S3
+ Chunk 2 ─────────> S3
+ Chunk 3 ─────────> S3
+ ...
+ Chunk 128 ───────> S3
+          |
+          v
+  CompleteMultipartUpload
+          |
+          v
+  S3 assembles original
+          |
+          v
+  S3 ObjectCreated Event
+          |
+          v
+   Processing Pipeline
+\`\`\`
+
+### Exactly what happens during chunking?
+
+Assume **1 GB = 1,024 MB**, with each chunk being **8 MB**, so there are **128 chunks**.
+
+1. **Client:** Splits the 1 GB file into 128 parts.
+2. **Video Service:** Initializes the S3 multipart upload and issues presigned URLs.
+3. **Client → S3:** Uploads parts directly, potentially in parallel.
+4. **S3 → Client:** Returns an ETag for each successfully uploaded part.
+5. **Video Service/DB:** Tracks the upload session and status; the client tracks the completed part numbers and ETags and can send them to the service.
+6. **Failure:** If chunk 50 fails, retry chunk 50 only.
+7. **Completion:** Once all 128 parts are uploaded, the client/service calls \`CompleteMultipartUpload\` with the part numbers and ETags. S3 combines the uploaded parts into the original object.
+
+**Important:** The 128 upload chunks are for transporting the file reliably. They are **not** the segments that users will eventually watch.
+
+## Stage 2 — S3 original video → Playable segments
+
+**This is where video processing and playback chunking happen.**
+
+\`\`\`text
+S3: original-video.mp4
+          |
+          v
+ S3 event → SQS / Worker
+          |
+          v
+ Step Functions / Temporal
+          |
+          v
+   Split video into
+    4-second segments
+          |
+          v
+    Parallel Workers
+    FFmpeg/MediaConvert
+          |
+    +-----+-----+
+    |     |     |
+   480p  720p  1080p
+    |     |     |
+    v     v     v
+   Write segments to S3
+          |
+          v
+ Generate HLS manifests
+          |
+          v
+ Metadata DB → READY
+\`\`\`
+
+For a **10-minute video**, each resolution has approximately **150 segments of 4 seconds**.
+
+S3 now contains something like:
+
+\`\`\`text
+videos/video123/
+│
+├── master.m3u8       ← Main manifest
+│
+├── 1080p/
+│   ├── playlist.m3u8
+│   ├── segment001.ts
+│   ├── segment002.ts
+│   └── ...
+│
+├── 720p/
+│   ├── playlist.m3u8
+│   ├── segment001.ts
+│   └── ...
+│
+└── 480p/
+    ├── playlist.m3u8
+    ├── segment001.ts
+    └── ...
+\`\`\`
+
+The **master manifest** tells the player which resolutions exist. Each resolution's playlist tells it where the actual segments are stored.
+
+**Implementation note:** Segmentation and transcoding may happen together inside FFmpeg/MediaConvert; the diagram shows the logical stages. A pipeline can process multiple renditions or aligned segment ranges in parallel.
+
+## Stage 3 — User presses Play
+
+\`\`\`text
+User clicks Play
+       |
+       v
+   API Gateway
+       |
+       v
+   Video Service
+       |
+       v
+   Metadata DB
+       |
+       v
+ Returns video metadata
+ + manifest CDN URL
+       |
+       v
+ Player requests master.m3u8
+       |
+       v
+      CDN
+       |
+       +-- HIT → Return cached manifest
+       |
+       +-- MISS → Fetch from S3
+       |
+       v
+ Player selects 1080p
+       |
+       v
+ Fetch 1080p playlist
+       |
+       v
+ Request segment001.ts
+       |
+       v
+ CDN → Player → Play
+       |
+       v
+ Request segment002.ts
+       |
+       v
+ Bandwidth drops
+       |
+       v
+ Switch to 480p playlist
+       |
+       v
+ Request 480p segment003.ts
+       |
+       v
+ Continue playback
+\`\`\`
+
+**Notice:** After getting the metadata and manifest URL, the player can fetch video segments directly through the CDN. Every segment does not need to go through the API Gateway or application pods.
+
+Switching quality works best when rendition segments have aligned playback boundaries.
+
+## Stage 4 — Who does what?
+
+| Component | Responsibility |
+|---|---|
+| Client | Splits original video for upload |
+| Video Service | Creates upload session and manages metadata |
+| S3 | Receives parts and stores completed video |
+| SQS + Step Functions | Initiates and orchestrates processing |
+| FFmpeg / MediaConvert | Transcodes and generates playback segments |
+| Manifest (\`.m3u8\`) | Lists available resolutions and segments |
+| CDN | Caches and serves manifests and segments |
+| Video Player | Downloads, buffers and switches quality |
+
+## The one distinction to remember
+
+**Upload chunking:** Client splits a large file into byte-sized parts → sends to S3 → S3 creates the original object.
+
+**Playback segmentation:** Processing workers create small, independently playable media segments at multiple qualities → CDN serves them → player downloads them progressively.
+
+This is the complete end-to-end flow you should explain in a system design interview.
