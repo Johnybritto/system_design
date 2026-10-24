@@ -197,3 +197,129 @@ In messaging, the queue backlog grows. In Kafka, consumer lag grows. You can sca
 **Queue = Who will do this work?**
 
 **Stream = What happened, and which systems need to react?**
+---
+
+## 9. Message Queues — Fast Interview Revision (Video Follow-up)
+
+**Reference:** [Message Queues in System Design — YouTube](https://www.youtube.com/watch?v=1ISRd0bS714)
+
+This section adds practical interview talking points and deeper failure scenarios without replacing any earlier messaging or streaming notes.
+
+### 9.1 What is a message queue?
+
+A **message queue** is an intermediary buffer between a **producer** and a **consumer** that enables asynchronous processing: the producer submits work without waiting for a worker to finish it.
+
+\`\`\`text
+Producer --> Message Queue --> Consumer / Worker
+               (buffers)        (processes)
+\`\`\`
+
+**Four reasons to use it:**
+1. **Asynchronous execution:** Return a response without waiting for background processing.
+2. **Decoupling:** Producer and consumer can deploy, fail, and scale independently.
+3. **Buffering traffic spikes:** Temporarily absorb bursts while workers catch up.
+4. **Reliability:** A suitably configured durable queue holds accepted work during transient consumer failures.
+
+**Example:** An image-upload API stores the original in S3, enqueues a thumbnail job in SQS, and returns \`202 Accepted\`. Workers resize the image later.
+
+> **Interview memory hook:** **Queue = Who will do this work?** **Stream = What happened, and who needs to react?**
+
+### 9.2 Exact queue processing and failure flow
+
+\`\`\`text
+Producer
+   |
+   v
+Queue (e.g., SQS)
+   |
+   v
+Consumer receives message
+   |
+   +-- Process successfully --> ACK / delete --> Done
+   |
+   +-- Processing fails / worker crashes
+          |
+          v
+       Retry / redelivery after visibility timeout
+          |
+          +-- Retry succeeds --> ACK / delete
+          |
+          +-- Retry limit reached --> DLQ --> Inspect / fix / redrive
+\`\`\`
+
+**ACK only after successful processing.** In SQS specifically, a consumer **deletes** the message when it finishes; receiving the message only makes it invisible for the configured visibility timeout. RabbitMQ has broker acknowledgements.
+
+**Poison message:** A malformed or consistently failing message can get redelivered forever unless retries are bounded. Configure a maximum receive/retry count, **DLQ**, backoff where applicable, and alert on DLQ depth. Fix the underlying issue before replaying DLQ messages.
+
+### 9.3 Delivery guarantees: most important distinction
+
+| Guarantee | Meaning | Trade-off / mitigation |
+|---|---|---|
+| **At-most-once** | Process zero or one time; failures may lose work | Lower duplicate risk, but potential loss |
+| **At-least-once** | Retry until delivery/processing is acknowledged under the system's configured guarantees | May process twice; **make side effects idempotent** |
+| **Exactly-once** | Each logical business action has one effect | Difficult end-to-end across DB/API boundaries; use idempotency, transactions, and reconciliation |
+
+**Critical failure example:**
+
+\`\`\`text
+Consumer receives message M123
+  --> DB transaction commits successfully
+  --> Consumer crashes BEFORE ACK
+  --> Queue redelivers M123
+  --> New consumer sees M123 already processed
+  --> Skips duplicate business side effect; then ACKs
+\`\`\`
+
+A robust implementation persists a unique **message ID / idempotency key** with the business update in one atomic database transaction. Kafka's exactly-once features do **not** automatically make external payments, DB writes, or HTTP calls exactly-once.
+
+### 9.4 Backpressure: a queue does not eliminate overload
+
+If the producer sends **300 messages/sec** but consumers handle only **200 messages/sec**, backlog increases at roughly **100 messages/sec**.
+
+**Respond by:**
+- Scaling out consumers if capacity and downstream dependencies permit.
+- Improving processing throughput and applying batching where safe.
+- Rate-limiting or throttling producers / rejecting excess new work.
+- Monitoring **queue depth**, **oldest-message age**, **processing latency**, **failure rate**, and **DLQ depth**.
+- Applying bounded retries with exponential backoff and jitter; otherwise retries can create a storm.
+
+**Interview line:** *A queue absorbs temporary bursts; if incoming rate remains higher than processing rate, delay grows without bound.*
+
+### 9.5 Ordering, partition keys, and scaling
+
+- Ordering depends on the technology and configuration: **SQS Standard** does not guarantee strict order; **SQS FIFO** supports order within message groups; **Kafka** preserves order **within a partition**, not across all partitions.
+- For payment/account events, use an \`account_id\` partition or message-group key when actions for the same account must stay ordered.
+- **Hot partition risk:** A small number of extremely busy keys can cause uneven load and consumer lag.
+- In Kafka, increasing partitions enables greater potential parallelism; within a **consumer group**, active partition processing is limited by the number of partitions.
+- Adding workers alone may not help if partitions, FIFO message groups, database connection pools, or downstream APIs are the actual bottleneck.
+
+### 9.6 When NOT to introduce a queue
+
+Avoid adding a queue solely for fashion if the user needs an **immediate synchronous result**, for example retrieving the current bank account balance. A queue adds operational complexity, eventual completion, and coordination requirements.
+
+An API may still synchronously validate a request and commit its authoritative state, then enqueue noncritical follow-up tasks asynchronously.
+
+### 9.7 Durability and broker failures
+
+| Failure | What can happen | What to design / monitor |
+|---|---|---|
+| Consumer pod crashes | Unacknowledged work returns for redelivery | Visibility timeout / ACK semantics; idempotency |
+| Poison message | Repeated failures and retry storm | Retry cap, DLQ, alerting and safe redrive |
+| Queue backlog grows | High end-to-end processing latency | Queue depth, message age, consumer capacity, throttle |
+| Broker or AZ fails | Temporary unavailability or data risk depending on broker configuration | Managed HA or replicated durable queues; validate durability and failover guarantees |
+| Duplicate delivery | Duplicate business effects if consumer is unsafe | Atomic idempotency-key check + transaction |
+| Downstream DB is slow | Workers pile up and may exhaust DB connections | Bounded concurrency, timeouts, backoff, circuit breaker |
+
+**Technology choice:** For simple background jobs and managed retry/DLQ capabilities, consider **SQS**. For broker-based task routing consider **RabbitMQ**. For high-throughput retained event history, replay and independent consumer groups, consider **Kafka**.
+
+### 9.8 30-second system design interview answer
+
+> I would introduce a message queue when work can be processed asynchronously, to decouple services, absorb temporary traffic spikes and make retries reliable. I would use at-least-once delivery with idempotent consumers, acknowledge only after successful processing, configure bounded retries and a DLQ, and monitor queue depth and oldest-message age. For scaling, I would add workers while checking downstream limits and ordering constraints. If producers consistently exceed consumers, I would apply backpressure rather than assuming the queue solves overload.
+
+**Eight things to remember:** **ASYNC · BUFFER · ACK · RETRY · DLQ · SCALE · ORDER · IDEMPOTENCY**
+
+### 9.9 Comparison against the earlier sections of this document
+
+**Already covered earlier:** producer/broker/consumer, asynchronous messaging, ACK, retry, DLQ, SQS visibility timeout, Kafka partitions, consumer groups, offsets, replay, duplicate handling and Kafka vs SQS.
+
+**Expanded here for interview readiness:** at-most-once vs at-least-once vs exactly-once, when not to use queues, partition-key selection and hot partitions, overload/backpressure math, poison-message controls, queue durability and operational alerts.
