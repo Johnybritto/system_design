@@ -614,3 +614,91 @@ Yes. Each region can have its own cache close to application workloads. Plan inv
 > If the workload needs write-behind behavior, I would distinguish a disposable cache from acknowledged business writes and ensure an appropriate durable log or queue, retry handling, DLQ where applicable and idempotent replay.
 
 **Remember:** **Consistency** = invalidation/TTL/versioning. **Performance & availability** = warming/single-flight/replicas/timeouts/fallback. **Durability & recovery** = queue/WAL/replication/retries/DLQ/replay.
+---
+
+## 13. Video Follow-up — Missing Caching Interview Topics
+
+**Video:** [Caching in System Design Interviews](https://www.youtube.com/watch?v=1NngTUYPdpI)
+
+**Comparison:** The earlier sections already cover cache-aside, read-through, write strategies, TTL, LRU/LFU, stampedes, invalidation, Redis HA and failover, DB fallback, retries, durability and recovery. The following are *additional interview points*; nothing above needs to be replaced.
+
+### 13.1 Hot key vs cache stampede — do not confuse them
+
+**Cache stampede — an entry is missing or expires:**
+- Example: 1,000 concurrent requests for \`product:1001\` reach Redis after its cached entry expires.
+- **Problem:** All 1,000 miss the same key and may hit the database at once.
+- **Mitigation:** Single-flight/request coalescing, controlled cache warming, TTL jitter, stale-while-revalidate when allowed, and bounded DB fallback.
+
+\`\`\`mermaid
+flowchart LR
+  A["1,000 concurrent requests"] --> B["Redis: key missing / expired"]
+  B --> C["Without protection: many DB reads"]
+  B --> D["With single-flight: one coordinated fetch"]
+  D --> E[(Database)]
+  E --> F["Repopulate Redis and share result"]
+\`\`\`
+
+**Hot key — an entry exists but receives disproportionate traffic:**
+- Example: Millions of requests repeatedly read \`product:1001\`, which maps to one busy Redis shard.
+- **Problem:** That shard/node, its network, or its CPU can become overloaded *despite a high cache hit ratio*; other shards may remain lightly loaded.
+- **Mitigation:** In-process local cache for safe-to-stale hot values, replication/read distribution where supported, request rate limiting, and carefully designed key/data distribution. Account for local cache invalidation and versioning.
+
+\`\`\`mermaid
+flowchart LR
+  A["Very high request volume"] --> B["One popular key"]
+  B --> C["Redis shard 1: overloaded"]
+  D["Other Redis shards"] -.-> E["Little traffic for this key"]
+\`\`\`
+
+| Attribute | Cache stampede | Hot key |
+|---|---|---|
+| Cache state | Key missing, expired or unavailable | Key is usually present |
+| Main pressure | Database / backing service during misses | Redis shard/node serving the hot entry |
+| Best first mitigation | Single-flight + controlled refill | Local caching / distribute reads |
+| Useful signals | Simultaneous misses, DB QPS spike | High per-key traffic, shard CPU/network imbalance |
+
+**Remember:** **Stampede = too many misses. Hot key = too many hits on the same key.**
+
+### 13.2 FIFO eviction — alongside LRU, LFU and TTL
+
+| Policy | Meaning | What to remember |
+|---|---|---|
+| **LRU** | Least recently used | Prefer removing entries not accessed recently |
+| **LFU** | Least frequently used | Prefer removing entries used less often |
+| **FIFO** | First in, first out | Remove the earliest inserted entry; does not account for recent/frequent usage |
+| **TTL** | Time to live | Expire an entry after its configured lifetime; **not itself a memory-pressure eviction policy** |
+
+**Redis nuance:** FIFO is a **general caching eviction concept**; Redis's common \`maxmemory-policy\` options include LRU-, LFU-, TTL-oriented and random policies, not a general FIFO option. TTL and memory-pressure eviction are distinct.
+
+### 13.3 Where to cache — and exactly what to cache
+
+| Cache location | Best use | Interview example |
+|---|---|---|
+| **Browser / client** | Reuse assets or data near the user | Repeat image/CSS requests, offline-friendly content |
+| **CDN / edge** | Serve globally requested static/media content | Product images, video segments, static assets |
+| **In-process memory** | Ultra-fast reads within a single application pod | Small frequently read config or hot product metadata |
+| **Redis distributed cache** | Reuse data shared across many API pods | \`product:1001\`, \`profile:user123\` |
+
+**Choose the *data and the key*, not just the product:**
+- Product detail: \`product:1001\` — cache-aside with a suitable TTL and invalidation after DB commit.
+- User profile: \`profile:user123\` — enforce authorization and data minimization; do not assume every field should be cached.
+- Public product image: CDN with versioned asset URLs and appropriate cache headers.
+- Hot read-only configuration: local in-process cache when short-lived staleness is acceptable.
+
+For a typical **EKS/AKS API**, Redis is often an application-level distributed cache, while CDN handles globally served assets. In-process caches can reduce Redis traffic but need their own staleness/invalidation plan. **Never cache sensitive or correctness-critical data without explicit freshness, access-control and invalidation requirements.**
+
+### 13.4 Five-step approach — how to introduce caching in an interview
+
+1. **Identify the bottleneck.** Is DB CPU, repeated expensive reads, throughput or API p95/p99 latency the problem?
+2. **Decide exactly what to cache.** Name the data and cache key (e.g., \`product:1001\`); specify whether stale reads are acceptable.
+3. **Choose a caching pattern.** Start with cache-aside for ordinary DB-backed reads unless the requirements favor something else.
+4. **Choose TTL and eviction.** Explain freshness/invalidation plus LRU or LFU based on workload; use TTL jitter for synchronized expiry risk.
+5. **Handle failures and scale.** Cover stale values, stampedes, hot keys, Redis HA, short timeouts, controlled DB fallback and gradual warming.
+
+**Do not start a design answer with “I will add Redis.”** First explain the bottleneck, the data that benefits from caching, and the consistency trade-off.
+
+### 13.5 30-second caching interview answer
+
+> I would first identify whether our latency or database read throughput justifies caching. For frequently accessed product data, I'd use Redis with cache-aside. The application checks Redis, and on a miss reads the database and populates Redis with a TTL. I would invalidate keys after successful DB updates, use LRU or LFU eviction based on access patterns, and protect against stampedes using single-flight. For hot keys, I could use local caching or distribute reads. Redis would run with replicas and failover, with a rate-limited DB fallback during outages.
+
+**Quick memory hook:** **Bottleneck → What/key → Strategy → TTL/eviction → Failure.**
