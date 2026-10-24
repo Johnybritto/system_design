@@ -340,3 +340,137 @@ API error/latency, upload completion time, abort rate, S3 failures, DB replicati
 - AWS S3 replication: https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication.html
 - AWS S3 Multi-Region Access Points: https://docs.aws.amazon.com/AmazonS3/latest/userguide/MultiRegionAccessPoints.html
 - AWS S3 resilience: https://docs.aws.amazon.com/AmazonS3/latest/userguide/DataDurability.html
+
+---
+
+## 13. HelloInterview additions — upload, file sharing, and CDN download flows
+
+Here is where the **4 improvements from HelloInterview** fit into the existing iCloud Drive architecture. The new additions are marked with ⭐.
+
+### 13.1 Upload flow — Fingerprinting, chunk verification and compression
+
+\`\`\`text
+Mac / iPhone selects file
+        |
+        v
+Optional Compression ⭐
+        |
+        v
+SHA-256 Fingerprint ⭐
+        |
+        v
+API Gateway → Upload Service
+        |
+        +--> Check existing upload session ⭐
+        |    Resume if incomplete
+        |
+        v
+Metadata DB (UPLOADING)
+        |
+        v
+Generate S3 Presigned URLs
+        |
+        v
+Client uploads chunks directly to S3
+        |
+        +-- Chunk 1 → ETag
+        +-- Chunk 2 → ETag
+        +-- Chunk 3 → ETag
+        |
+        v
+Upload Service → S3 ListParts ⭐
+        |
+        v
+Verify uploaded parts and checksums
+        |
+        v
+S3 CompleteMultipartUpload
+        |
+        v
+Metadata DB → ACTIVE
+        |
+        v
+Outbox → SQS → Sync Notification
+        |
+        v
+Other devices fetch changes
+\`\`\`
+
+### 13.2 File sharing — Additional API and DB table
+
+\`\`\`text
+User selects "Share File"
+        |
+        v
+API Gateway
+        |
+        v
+File Sharing Service ⭐
+        |
+        v
+Check file ownership / permissions
+        |
+        v
+SharedFiles Table ⭐
+(fileId, userId, permission)
+        |
+        v
+Outbox → Notification Service
+        |
+        v
+Recipient notified
+        |
+        v
+Recipient requests file
+        |
+        v
+Authorization against sharing permissions
+\`\`\`
+
+### 13.3 Download flow — Signed CDN access
+
+\`\`\`text
+iPhone requests file
+        |
+        v
+API Gateway
+        |
+        v
+Metadata / File Service
+        |
+        +--> Metadata DB
+        |
+        +--> SharedFiles Table ⭐
+        |
+        v
+Authorization successful
+        |
+        v
+Generate signed CDN URL ⭐
+        |
+        v
+iPhone → CloudFront CDN
+        |
+        +-- Cache HIT → Return file
+        |
+        +-- Cache MISS → S3
+        |                 |
+        |                 v
+        |              CloudFront
+        |
+        v
+Download (HTTP Range if needed)
+        |
+        v
+Verify checksum
+        |
+        v
+Decompress if applicable ⭐
+        |
+        v
+Save file on iPhone
+\`\`\`
+
+**Important:** For private files, CloudFront must enforce signed access and use a private S3 origin. Compression is optional, especially because videos and many other formats are already compressed.
+
+The existing **multipart upload, change-feed synchronization, version conflict handling, and multi-region DR remain unchanged**. These additions fit into the existing flows without requiring another architecture.
