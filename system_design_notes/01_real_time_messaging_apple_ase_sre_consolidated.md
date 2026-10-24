@@ -18,6 +18,212 @@ Example assumptions (illustrative, *not production measurements*): millions of u
 
 **Key contract:** An **ACCEPTED** ACK means the message has been durably committed according to the chosen database guarantees. It does **not** mean Bob has received or read it.
 
+### API Contracts — Point 1: API Contract Summary
+
+For this architecture, **WebSocket events** handle real-time messaging while **REST APIs** handle conversation setup and message history/offline synchronization. These are illustrative interview contracts.
+
+| API / Event | Protocol | Purpose |
+|---|---|---|
+| \`POST /v1/conversations\` | REST | Create a conversation |
+| \`GET /v1/conversations/{id}/messages\` | REST | Retrieve history and offline messages |
+| \`message.send\` | WebSocket | Alice sends a message |
+| \`message.delivery_ack\` | WebSocket | Bob confirms his app received the message |
+| \`message.read\` | WebSocket | Bob reports reading messages |
+| \`presence.heartbeat\` | WebSocket | Refresh online presence / connection state |
+
+### API Contracts — Point 2: Exact Message Flow and Events
+
+\`\`\`text
+Alice --message.send--> WebSocket Gateway --> Messaging Service
+                                               |
+                                               v
+                              DynamoDB atomic commit (message + outbox)
+                                               |
+                               message.accepted <--+-- ACK to Alice
+                                               |
+                                               v
+                                Outbox Publisher --> Kafka
+                                                    |
+                                                    v
+                                               Delivery Worker
+                                                    |
+                                              Redis lookup
+                                                    |
+                                                    v
+                                            Bob's WebSocket Gateway
+                                                    |
+                                             message.new --> Bob
+                                                    |
+                                    Bob --message.delivery_ack-->
+                                                    |
+                                     Save receipt; notify Alice
+\`\`\`
+
+**A. Alice sends a message — WebSocket \`message.send\`**
+
+\`\`\`json
+{
+  "type": "message.send",
+  "clientMessageId": "uuid-123",
+  "conversationId": "conv-100",
+  "payload": {
+    "type": "text",
+    "text": "Hello Bob"
+  }
+}
+\`\`\`
+
+Messaging Service validates Alice's identity and conversation membership, checks \`clientMessageId\` for an existing send, then atomically stores the message, authoritative sequence, idempotency record and outbox event.
+
+**Response to Alice only after durable DB commit — \`message.accepted\`:**
+
+\`\`\`json
+{
+  "type": "message.accepted",
+  "clientMessageId": "uuid-123",
+  "messageId": "msg-105",
+  "conversationId": "conv-100",
+  "sequence": 105,
+  "status": "ACCEPTED",
+  "serverTimestamp": "2026-10-24T10:00:00Z"
+}
+\`\`\`
+
+**B. Bob receives the message — server-to-client \`message.new\`**
+
+\`\`\`json
+{
+  "type": "message.new",
+  "conversationId": "conv-100",
+  "messageId": "msg-105",
+  "sequence": 105,
+  "senderId": "alice",
+  "payload": {
+    "type": "text",
+    "text": "Hello Bob"
+  }
+}
+\`\`\`
+
+**Bob acknowledges receipt — \`message.delivery_ack\`:**
+
+\`\`\`json
+{
+  "type": "message.delivery_ack",
+  "messageId": "msg-105",
+  "conversationId": "conv-100",
+  "deviceId": "bob-iphone"
+}
+\`\`\`
+
+The backend validates the ACK, updates durable delivery state and notifies Alice. A gateway socket write alone is **not** a device delivery ACK.
+
+**C. Bob reads the message — WebSocket \`message.read\`**
+
+\`\`\`json
+{
+  "type": "message.read",
+  "conversationId": "conv-100",
+  "lastReadSequence": 105,
+  "deviceId": "bob-iphone"
+}
+\`\`\`
+
+**Alice receives the resulting receipt update:**
+
+\`\`\`json
+{
+  "type": "message.receipt_updated",
+  "conversationId": "conv-100",
+  "lastReadSequence": 105,
+  "status": "READ"
+}
+\`\`\`
+
+Read positions are validated against Bob's authenticated identity, conversation membership and permitted message range. **ACCEPTED ≠ PUBLISHED ≠ DELIVERED ≠ READ.**
+
+### Database Fields — Five Core Tables
+
+For the **DynamoDB + Kafka + Redis** messaging design, these are **five logical durable tables** with the interview-important fields only.
+
+**1. Conversations — who is chatting?**
+
+| Field | Why it exists |
+|---|---|
+| \`conversationId\` (PK) | Unique conversation identifier |
+| \`participantIds\` | Alice/Bob membership for chat authorization |
+| \`lastSequence\` | Coordinate per-conversation message ordering |
+| \`createdAt\` | Conversation creation time |
+| \`updatedAt\` | Last activity time |
+
+**2. Messages — what was sent?**
+
+| Field | Why it exists |
+|---|---|
+| \`conversationId\` (PK) | Query messages for one chat |
+| \`sequence\` (SK) | Read messages in conversation order |
+| \`messageId\` | Stable ID for deduplication and receipts |
+| \`senderId\` | Identify message author |
+| \`payload\` | Store message content (ciphertext where E2EE applies) |
+| \`createdAt\` | Persist server creation time |
+
+**3. Idempotency — was it already sent?**
+
+| Field | Why it exists |
+|---|---|
+| \`senderId\` (PK) | Scope a client's message ID to the sender |
+| \`clientMessageId\` (SK) | Identify repeated send attempts |
+| \`messageId\` | Return original saved message on retry |
+| \`payloadHash\` | Reject reuse of a key with changed content |
+| \`createdAt\` | Audit and retention |
+
+Use the unique \`(senderId, clientMessageId)\` combination with atomic/conditional checking.
+
+**4. Outbox — did the event reach Kafka?**
+
+| Field | Why it exists |
+|---|---|
+| \`eventId\` (PK) | Unique publication event |
+| \`messageId\` | Reference the saved message |
+| \`conversationId\` | Partition delivery events by chat |
+| \`status\` | \`PENDING\` / \`PUBLISHED\` lifecycle |
+| \`createdAt\` | Measure stuck event age |
+| \`publishedAt\` | Know when Kafka acknowledged the publication |
+
+Outbox records must be written **in the same atomic transaction** as the message; publisher completion does not imply delivery to Bob.
+
+**5. DeviceSync / Receipts — what has each device received/read?**
+
+| Field | Why it exists |
+|---|---|
+| \`userId\` | Recipient/user identity |
+| \`deviceId\` | Distinguish Bob's phone from laptop |
+| \`conversationId\` | Scope progress to the conversation |
+| \`lastDeliveredSeq\` | Highest contiguous sequence delivered to this device |
+| \`lastReadSeq\` | Highest sequence reported read |
+| \`lastSyncedSeq\` | Resume after disconnection |
+
+Use a unique composite identity for **user + device + conversation** (possibly encoded across DynamoDB PK/SK), so syncing one device doesn't accidentally advance another device.
+
+**Database flow to remember:**
+
+\`\`\`text
+Alice message.send
+   --> Conversations (membership + ordered sequence)
+   --> Idempotency (duplicate check)
+   --> Messages (durable message)
+   --> Outbox (pending Kafka event)
+            [atomic transaction before ACCEPTED ACK]
+   --> Kafka --> Delivery Worker --> Redis gateway lookup
+   --> Bob device --> DeviceSync / Receipts (delivery/read progress)
+\`\`\`
+
+**Memory shortcut:** **Conversations = who; Messages = what; Idempotency = already?; Outbox = published?; DeviceSync = delivered/read where?**
+
+Redis is **not** one of these durable tables. It maintains temporary \`userId/deviceId → gatewayId/connectionId\` mappings with TTL.
+
+---
+
 ## 2. Component selection — what, why, where?
 
 | # | Component | AWS / EKS implementation | Azure equivalent | Why do we need it? |
