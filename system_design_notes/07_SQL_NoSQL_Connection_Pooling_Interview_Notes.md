@@ -761,3 +761,190 @@ No. Aggressive retries can make the situation worse. Use bounded retries with ex
 For high availability, I would deploy multiple application instances, an HA database endpoint and database replicas with automatic failover. The application pool should detect broken connections and reconnect to the new primary."
 
 **Remember:** Connection pooling improves efficiency. Replication and failover provide HA.
+
+---
+
+## Data Modeling — Missing Interview Topics (Hello Interview Follow-up)
+
+**Reference:** [Hello Interview — Data Modeling](https://www.hellointerview.com/learn/system-design/core-concepts/data-modeling)
+
+**Purpose:** The sections above explain SQL vs NoSQL, ACID, HA, replication, RPO/RTO and connection pooling. This **append-only addendum** covers the practical data-modeling questions to answer **during a system design interview**: entities, relationships, access patterns, indexes, normalization, partition keys and scaling.
+
+### 1. Start with functional requirements, not with a database product
+
+Before saying "I'll use PostgreSQL" or "I'll use DynamoDB":
+
+1. Identify the **critical user journeys and APIs**.
+2. List the **entities** those journeys create or read.
+3. Define **fields, primary keys, foreign keys and uniqueness constraints**.
+4. Map the **actual read/write queries** to indexes or NoSQL access patterns.
+5. Decide **consistency and transaction boundaries**.
+6. Estimate scale and introduce partitioning/sharding **only when justified**.
+
+**Example — social posts/likes:** Users create posts, list posts for a user, like/unlike a post, and see a like count. Start with **Users**, **Posts**, **Likes**.
+
+### 2. Schema design and relationships (1:1, 1:N, N:M)
+
+**Example entity relationship diagram:**
+
+\`\`\`mermaid
+erDiagram
+    USERS ||--o{ POSTS : creates
+    USERS ||--o{ LIKES : gives
+    POSTS ||--o{ LIKES : receives
+    USERS {
+      bigint id PK
+      varchar username
+      varchar email UK
+    }
+    POSTS {
+      bigint id PK
+      bigint user_id FK
+      text content
+      timestamp created_at
+      bigint like_count
+    }
+    LIKES {
+      bigint user_id PK,FK
+      bigint post_id PK,FK
+      timestamp created_at
+    }
+\`\`\`
+
+| Relationship | Example | Usual SQL implementation |
+|---|---|---|
+| **1:1** | User ↔ Profile | \`profiles.user_id\` is a **UNIQUE** foreign key |
+| **1:N** | User → Posts | \`posts.user_id\` foreign key |
+| **N:M** | Users ↔ Posts they liked | Junction table \`likes(user_id, post_id)\` |
+
+Minimal illustrative PostgreSQL schema:
+
+\`\`\`sql
+CREATE TABLE users (
+    id BIGINT PRIMARY KEY,
+    username TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE posts (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id),
+    content TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    like_count BIGINT NOT NULL DEFAULT 0
+);
+
+CREATE TABLE likes (
+    user_id BIGINT NOT NULL REFERENCES users(id),
+    post_id BIGINT NOT NULL REFERENCES posts(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, post_id)
+);
+\`\`\`
+
+**Why a composite primary key on \`likes\`?** It enforces "one like per user per post" even if duplicate requests arrive. The authoritative action should be transaction-safe and idempotent; if \`posts.like_count\` is a stored derived value, its update must be coordinated with insert/delete or reconciled later.
+
+**Interview talking point:** Define key relationships and constraints, but don't spend the entire interview exhaustively naming every column.
+
+### 3. Design indexes FROM the APIs and access patterns
+
+**API:** \`GET /users/101/posts?limit=20\` — newest posts from user 101.
+
+\`\`\`sql
+SELECT id, user_id, content, created_at
+FROM posts
+WHERE user_id = 101
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+\`\`\`
+
+Useful composite PostgreSQL index:
+
+\`\`\`sql
+CREATE INDEX idx_posts_user_created_id
+ON posts (user_id, created_at DESC, id DESC);
+\`\`\`
+
+**Why that order?** \`user_id\` supports the equality filter; \`created_at DESC, id DESC\` supports consistent newest-first ordering and efficient keyset pagination. Include a stable tie-breaker (\`id\`) if timestamps can match.
+
+| Important API/query | Likely index/key | Why |
+|---|---|---|
+| \`GET /users/{id}/posts\` newest first | \`posts(user_id, created_at DESC, id DESC)\` | Filter by user, avoid expensive sort, paginate |
+| Check if user already liked a post | \`likes(user_id, post_id)\` PK | Fast point lookup and uniqueness |
+| List users who liked a post | \`likes(post_id, user_id)\` additional index | Reverse lookup isn't necessarily efficient with the PK above |
+| Look up user by email | \`users(email)\` UNIQUE | Efficient lookup and uniqueness enforcement |
+
+**Important caveat:** Each additional index consumes storage and adds write overhead. Use measured query patterns and \`EXPLAIN ANALYZE\` instead of blindly indexing every field. Keyset/cursor pagination avoids large-offset scans for very deep lists.
+
+**Interview memory hook:** **API → WHERE → ORDER BY → INDEX**.
+
+### 4. Normalization vs denormalization — practical trade-off
+
+| Normalization | Denormalization |
+|---|---|
+| Keep each fact in one authoritative place | Duplicate or precompute selected data |
+| Less update inconsistency | Potentially faster read paths |
+| Queries may need joins | Fewer joins for hot queries |
+| Easier integrity enforcement | Must handle stale/duplicated values |
+
+**Example:** Keep every user/post like in the normalized \`likes\` table. For a hot feed, maintain a convenient \`posts.like_count\` summary to avoid counting a large number of likes during every feed read.
+
+**Trade-off:** The count can drift from the authoritative likes during failures or concurrent updates. Use an atomic transaction when practical, or events + idempotent updates + reconciliation when eventual consistency is acceptable.
+
+**Interview answer:** *Start normalized for correctness, then selectively denormalize only for demonstrated read patterns and with a defined consistency strategy.*
+
+### 5. Choosing shard/partition keys — with hotspot and query trade-offs
+
+Choose a key using **which API must be fast, cardinality/data distribution, write/read skew, growth and whether operations span shards**.
+
+| Example shard key | Helps | Risk |
+|---|---|---|
+| \`user_id\` | Efficient colocated reads of a user's posts | Extremely active users may create hot shards |
+| Hash of \`post_id\` | Distributes individual posts more evenly | Fetching posts by user may fan out to many shards |
+| \`created_at\` time ranges | Archival and time-window queries | Current time range receives most new writes (hot shard) |
+
+**Hot shard:** One shard receives disproportionate traffic; adding shards does not necessarily help if the hot key always maps to one shard.
+
+**Cross-shard query:** A query needs data from multiple shards, increasing fan-out, latency and coordination; cross-shard transactions/joins become harder.
+
+**Mitigations:** Reconsider the shard key, use compound/bucketed keys for very hot tenants when compatible with queries, precompute read models and/or isolate exceptional hot workloads. Do not shard prematurely if indexes, replicas and vertical scaling meet your requirements.
+
+**Interview answer:** *For user-owned posts, I'd initially favor a user-based key because users query their own posts, but I would check for celebrity/hot-user skew and the need for global feed queries before finalizing it.*
+
+### 6. NoSQL data modeling: embedding, referencing and access patterns
+
+**Embedding (document NoSQL):** Store related small/bounded data with the parent when it is usually fetched together.
+- Example: A profile document containing a few display preferences.
+- **Benefit:** Fewer separate reads for that access pattern.
+- **Risk:** Large/unbounded arrays, bigger document updates, duplication and difficult pagination.
+
+**Referencing:** Store related entities separately and connect them by IDs.
+- Example: Keep millions of posts in a posts collection rather than embedding them all in one user profile.
+- **Benefit:** Independent growth, pagination and updates.
+- **Trade-off:** Requires additional reads or application-side coordination.
+
+For **DynamoDB-like access-pattern modeling**, ask: *What is the partition key (PK), sort key (SK), and which queries require a secondary index (GSI)?* For example, a table organized around a user's posts might use \`PK = USER#101\`, \`SK = POST#<timestamp>#<post_id>\`, while a separately designed lookup/index supports post-by-ID access. Model hot partitions and write limits; secondary indexes add write/storage costs and have consistency implications.
+
+| NoSQL model | Useful for | Interview caution |
+|---|---|---|
+| Document (MongoDB, etc.) | Flexible, related documents | Embed bounded data; reference unbounded collections |
+| Key-value / DynamoDB | Predictable key-based access at scale | PK/SK/GSI must support real APIs; watch hot keys |
+| Wide-column (Cassandra) | Very large partition-oriented write workloads | Design partition + clustering keys around queries |
+| Graph (Neo4j/Neptune) | Deep, changing relationship traversals | Simple follows/likes do not automatically require a graph DB |
+
+**Remember:** NoSQL is not "schema-free design." The access patterns and consistency rules are still deliberate.
+
+### 7. Six-step data-modeling interview framework
+
+1. **Entities:** Identify User, Post, Like, Order, Payment, Message, etc.
+2. **Fields and identifiers:** Define primary keys, timestamps, status and uniqueness constraints.
+3. **Relationships:** Model 1:1, 1:N, N:M and transaction boundaries.
+4. **Queries and indexes:** Map core APIs to WHERE/ORDER BY or PK/SK/GSI access patterns.
+5. **Normalization:** Start with sound authoritative data; denormalize selected hot reads with an update/consistency plan.
+6. **Scale:** Estimate volume and read/write load; choose partition/shard keys only if needed, accounting for hotspots and cross-shard operations.
+
+**30-second interview answer:**
+
+> I would start by identifying the main entities from the functional requirements, then define their primary keys, foreign keys and relationships. I would choose a relational database when transactions and integrity are important, and design indexes based on the API queries, including composite indexes where they help. I would start with normalized data and denormalize selectively for high-volume read paths with clear consistency guarantees. Finally, I would estimate data growth and choose an appropriate partition or shard key only if required by scale.
+
+**Quick memory hook:** **Entities → Keys → Relationships → APIs/Indexes → Consistency → Scale**.
