@@ -27,7 +27,7 @@ The Hello Interview design particularly emphasizes database concurrency protecti
 
 ### Scenario 1: Redis ticket lock fails
 
-\`\`\`text id="lg85kp"
+```text id="lg85kp"
 User A and User B select Seat 101
               |
               v
@@ -44,13 +44,13 @@ User A and User B select Seat 101
               |
               v
       No double booking
-\`\`\`
+```
 
 **Key:** PostgreSQL is the final source of truth. Redis must never be the only protection against double booking.
 
 ### Scenario 2: Payment successful but Booking Service crashes
 
-\`\`\`text id="16559m"
+```text id="16559m"
 Stripe: Payment Successful
              |
              v
@@ -65,13 +65,13 @@ Stripe: Payment Successful
              v
  Confirm ticket if valid
  OR refund the payment
-\`\`\`
+```
 
 **Key:** Never charge twice. Use idempotency and reconciliation.
 
 ### Scenario 3: SQS worker crashes during booking
 
-\`\`\`text id="1tftxc"
+```text id="1tftxc"
 SQS FIFO
     |
     v
@@ -94,7 +94,7 @@ DB idempotency check
     |
     v
 Process once logically
-\`\`\`
+```
 
 If repeated processing fails, configure a **Dead Letter Queue (DLQ)** and investigate the failed reservation. <Cite ref="turn144231search0"/>
 
