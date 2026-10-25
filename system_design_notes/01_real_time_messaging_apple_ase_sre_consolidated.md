@@ -24,16 +24,16 @@ For this architecture, **WebSocket events** handle real-time messaging while **R
 
 | API / Event | Protocol | Purpose |
 |---|---|---|
-| \`POST /v1/conversations\` | REST | Create a conversation |
-| \`GET /v1/conversations/{id}/messages\` | REST | Retrieve history and offline messages |
-| \`message.send\` | WebSocket | Alice sends a message |
-| \`message.delivery_ack\` | WebSocket | Bob confirms his app received the message |
-| \`message.read\` | WebSocket | Bob reports reading messages |
-| \`presence.heartbeat\` | WebSocket | Refresh online presence / connection state |
+| `POST /v1/conversations` | REST | Create a conversation |
+| `GET /v1/conversations/{id}/messages` | REST | Retrieve history and offline messages |
+| `message.send` | WebSocket | Alice sends a message |
+| `message.delivery_ack` | WebSocket | Bob confirms his app received the message |
+| `message.read` | WebSocket | Bob reports reading messages |
+| `presence.heartbeat` | WebSocket | Refresh online presence / connection state |
 
 ### API Contracts — Point 2: Exact Message Flow and Events
 
-\`\`\`text
+```text
 Alice --message.send--> WebSocket Gateway --> Messaging Service
                                                |
                                                v
@@ -57,11 +57,27 @@ Alice --message.send--> WebSocket Gateway --> Messaging Service
                                     Bob --message.delivery_ack-->
                                                     |
                                      Save receipt; notify Alice
-\`\`\`
+```
 
-**A. Alice sends a message — WebSocket \`message.send\`**
+```mermaid
+flowchart TD
+  A["Alice"] -->|"message.send"| G["WebSocket Gateway"]
+  G --> M["Messaging Service"]
+  M --> DB["DynamoDB atomic commit: message + outbox"]
+  DB -->|"message.accepted: ACK"| A
+  DB --> P["Outbox Publisher"]
+  P --> K["Kafka"]
+  K --> W["Delivery Worker"]
+  W --> R["Redis lookup"]
+  R --> BG["Bob's WebSocket Gateway"]
+  BG -->|"message.new"| B["Bob"]
+  B -->|"message.delivery_ack"| BG
+  BG --> S["Save receipt; notify Alice"]
+```
 
-\`\`\`json
+**A. Alice sends a message — WebSocket `message.send`**
+
+```json
 {
   "type": "message.send",
   "clientMessageId": "uuid-123",
@@ -71,13 +87,13 @@ Alice --message.send--> WebSocket Gateway --> Messaging Service
     "text": "Hello Bob"
   }
 }
-\`\`\`
+```
 
-Messaging Service validates Alice's identity and conversation membership, checks \`clientMessageId\` for an existing send, then atomically stores the message, authoritative sequence, idempotency record and outbox event.
+Messaging Service validates Alice's identity and conversation membership, checks `clientMessageId` for an existing send, then atomically stores the message, authoritative sequence, idempotency record and outbox event.
 
-**Response to Alice only after durable DB commit — \`message.accepted\`:**
+**Response to Alice only after durable DB commit — `message.accepted`:**
 
-\`\`\`json
+```json
 {
   "type": "message.accepted",
   "clientMessageId": "uuid-123",
@@ -87,11 +103,11 @@ Messaging Service validates Alice's identity and conversation membership, checks
   "status": "ACCEPTED",
   "serverTimestamp": "2026-10-24T10:00:00Z"
 }
-\`\`\`
+```
 
-**B. Bob receives the message — server-to-client \`message.new\`**
+**B. Bob receives the message — server-to-client `message.new`**
 
-\`\`\`json
+```json
 {
   "type": "message.new",
   "conversationId": "conv-100",
@@ -103,42 +119,42 @@ Messaging Service validates Alice's identity and conversation membership, checks
     "text": "Hello Bob"
   }
 }
-\`\`\`
+```
 
-**Bob acknowledges receipt — \`message.delivery_ack\`:**
+**Bob acknowledges receipt — `message.delivery_ack`:**
 
-\`\`\`json
+```json
 {
   "type": "message.delivery_ack",
   "messageId": "msg-105",
   "conversationId": "conv-100",
   "deviceId": "bob-iphone"
 }
-\`\`\`
+```
 
 The backend validates the ACK, updates durable delivery state and notifies Alice. A gateway socket write alone is **not** a device delivery ACK.
 
-**C. Bob reads the message — WebSocket \`message.read\`**
+**C. Bob reads the message — WebSocket `message.read`**
 
-\`\`\`json
+```json
 {
   "type": "message.read",
   "conversationId": "conv-100",
   "lastReadSequence": 105,
   "deviceId": "bob-iphone"
 }
-\`\`\`
+```
 
 **Alice receives the resulting receipt update:**
 
-\`\`\`json
+```json
 {
   "type": "message.receipt_updated",
   "conversationId": "conv-100",
   "lastReadSequence": 105,
   "status": "READ"
 }
-\`\`\`
+```
 
 Read positions are validated against Bob's authenticated identity, conversation membership and permitted message range. **ACCEPTED ≠ PUBLISHED ≠ DELIVERED ≠ READ.**
 
@@ -150,45 +166,45 @@ For the **DynamoDB + Kafka + Redis** messaging design, these are **five logical 
 
 | Field | Why it exists |
 |---|---|
-| \`conversationId\` (PK) | Unique conversation identifier |
-| \`participantIds\` | Alice/Bob membership for chat authorization |
-| \`lastSequence\` | Coordinate per-conversation message ordering |
-| \`createdAt\` | Conversation creation time |
-| \`updatedAt\` | Last activity time |
+| `conversationId` (PK) | Unique conversation identifier |
+| `participantIds` | Alice/Bob membership for chat authorization |
+| `lastSequence` | Coordinate per-conversation message ordering |
+| `createdAt` | Conversation creation time |
+| `updatedAt` | Last activity time |
 
 **2. Messages — what was sent?**
 
 | Field | Why it exists |
 |---|---|
-| \`conversationId\` (PK) | Query messages for one chat |
-| \`sequence\` (SK) | Read messages in conversation order |
-| \`messageId\` | Stable ID for deduplication and receipts |
-| \`senderId\` | Identify message author |
-| \`payload\` | Store message content (ciphertext where E2EE applies) |
-| \`createdAt\` | Persist server creation time |
+| `conversationId` (PK) | Query messages for one chat |
+| `sequence` (SK) | Read messages in conversation order |
+| `messageId` | Stable ID for deduplication and receipts |
+| `senderId` | Identify message author |
+| `payload` | Store message content (ciphertext where E2EE applies) |
+| `createdAt` | Persist server creation time |
 
 **3. Idempotency — was it already sent?**
 
 | Field | Why it exists |
 |---|---|
-| \`senderId\` (PK) | Scope a client's message ID to the sender |
-| \`clientMessageId\` (SK) | Identify repeated send attempts |
-| \`messageId\` | Return original saved message on retry |
-| \`payloadHash\` | Reject reuse of a key with changed content |
-| \`createdAt\` | Audit and retention |
+| `senderId` (PK) | Scope a client's message ID to the sender |
+| `clientMessageId` (SK) | Identify repeated send attempts |
+| `messageId` | Return original saved message on retry |
+| `payloadHash` | Reject reuse of a key with changed content |
+| `createdAt` | Audit and retention |
 
-Use the unique \`(senderId, clientMessageId)\` combination with atomic/conditional checking.
+Use the unique `(senderId, clientMessageId)` combination with atomic/conditional checking.
 
 **4. Outbox — did the event reach Kafka?**
 
 | Field | Why it exists |
 |---|---|
-| \`eventId\` (PK) | Unique publication event |
-| \`messageId\` | Reference the saved message |
-| \`conversationId\` | Partition delivery events by chat |
-| \`status\` | \`PENDING\` / \`PUBLISHED\` lifecycle |
-| \`createdAt\` | Measure stuck event age |
-| \`publishedAt\` | Know when Kafka acknowledged the publication |
+| `eventId` (PK) | Unique publication event |
+| `messageId` | Reference the saved message |
+| `conversationId` | Partition delivery events by chat |
+| `status` | `PENDING` / `PUBLISHED` lifecycle |
+| `createdAt` | Measure stuck event age |
+| `publishedAt` | Know when Kafka acknowledged the publication |
 
 Outbox records must be written **in the same atomic transaction** as the message; publisher completion does not imply delivery to Bob.
 
@@ -196,18 +212,18 @@ Outbox records must be written **in the same atomic transaction** as the message
 
 | Field | Why it exists |
 |---|---|
-| \`userId\` | Recipient/user identity |
-| \`deviceId\` | Distinguish Bob's phone from laptop |
-| \`conversationId\` | Scope progress to the conversation |
-| \`lastDeliveredSeq\` | Highest contiguous sequence delivered to this device |
-| \`lastReadSeq\` | Highest sequence reported read |
-| \`lastSyncedSeq\` | Resume after disconnection |
+| `userId` | Recipient/user identity |
+| `deviceId` | Distinguish Bob's phone from laptop |
+| `conversationId` | Scope progress to the conversation |
+| `lastDeliveredSeq` | Highest contiguous sequence delivered to this device |
+| `lastReadSeq` | Highest sequence reported read |
+| `lastSyncedSeq` | Resume after disconnection |
 
 Use a unique composite identity for **user + device + conversation** (possibly encoded across DynamoDB PK/SK), so syncing one device doesn't accidentally advance another device.
 
 **Database flow to remember:**
 
-\`\`\`text
+```text
 Alice message.send
    --> Conversations (membership + ordered sequence)
    --> Idempotency (duplicate check)
@@ -216,11 +232,26 @@ Alice message.send
             [atomic transaction before ACCEPTED ACK]
    --> Kafka --> Delivery Worker --> Redis gateway lookup
    --> Bob device --> DeviceSync / Receipts (delivery/read progress)
-\`\`\`
+```
+
+```mermaid
+flowchart TD
+  A["Alice: message.send"] --> C["Conversations: membership + ordered sequence"]
+  C --> I["Idempotency: duplicate check"]
+  I --> M["Messages: durable message"]
+  M --> O["Outbox: pending Kafka event"]
+  O --> T["Atomic transaction before ACCEPTED ACK"]
+  T -->|"ACCEPTED ACK"| Alice["Alice"]
+  T --> K["Kafka"]
+  K --> W["Delivery Worker"]
+  W --> R["Redis gateway lookup"]
+  R --> B["Bob device"]
+  B --> D["DeviceSync / Receipts: delivery/read progress"]
+```
 
 **Memory shortcut:** **Conversations = who; Messages = what; Idempotency = already?; Outbox = published?; DeviceSync = delivered/read where?**
 
-Redis is **not** one of these durable tables. It maintains temporary \`userId/deviceId → gatewayId/connectionId\` mappings with TTL.
+Redis is **not** one of these durable tables. It maintains temporary `userId/deviceId → gatewayId/connectionId` mappings with TTL.
 
 ---
 
