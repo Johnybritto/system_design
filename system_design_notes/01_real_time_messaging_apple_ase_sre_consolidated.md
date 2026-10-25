@@ -269,6 +269,15 @@ Alice → DNS → NLB → WebSocket Gateway Pod 1
                  Messaging Service
 ~~~
 
+```mermaid
+flowchart TD
+  A["Alice"] --> B["DNS"]
+  B --> C["NLB"]
+  C --> D["WebSocket Gateway Pod 1"]
+  D --> E["Persistent WSS socket"]
+  E --> F["Messaging Service"]
+```
+
 **Memory line:** Gateway pod fails → reconnect + authenticate + synchronize; no accepted message is lost merely because the socket died.
 
 ### 2.3 Messaging Service pod (step 4)
@@ -333,6 +342,20 @@ BEGIN ATOMIC TRANSACTION
 COMMIT → ACCEPTED ACK to Alice
 ~~~
 
+```mermaid
+flowchart TD
+  T["BEGIN ATOMIC TRANSACTION"]
+  T --> M["Save Message: conversation 100, seq 105"]
+  T --> I["Save idempotency result: alice, uuid-123"]
+  T --> S["Update / validate conversation sequence ownership"]
+  T --> O["Save Outbox event: event-105"]
+  M --> C["COMMIT"]
+  I --> C
+  S --> C
+  O --> C
+  C --> A["ACCEPTED ACK to Alice"]
+```
+
 If the outbox write fails **before commit**, the transaction does not commit; do **not** acknowledge success.
 
 **Technical sequencing nuance:** The authoritative sequence must be allocated under a conditional-write/transaction or fenced conversation ownership. DynamoDB does not magically provide a gap-free increment from multiple concurrent Messaging Service pods. An implementation can use optimistic concurrency (read current version/sequence, conditionally transactionally update it and insert message, retry on conflict) or a fenced conversation sequencer. Sequence gaps might be permitted under some designs; define requirements.
@@ -350,6 +373,18 @@ ONE logical Messages table
 Each physical partition's data is replicated
 across AZs by the managed database (availability/durability).
 ~~~
+
+```mermaid
+flowchart TD
+  T["ONE logical Messages table"]
+  T --> P["PARTITIONING / SHARDING for scale"]
+  P --> A["Physical partition A: many conversation keys"]
+  P --> B["Physical partition B: other keys"]
+  P --> C["Physical partition C: other keys"]
+  A --> RA["Replicated across AZs"]
+  B --> RB["Replicated across AZs"]
+  C --> RC["Replicated across AZs"]
+```
 
 - DynamoDB decides physical partition distribution; **conversationId does not create one physical partition per chat**. A huge/hot conversation can still stress one partition-key access pattern.
 - **Sharding/partitioning = spread data and workload**. **Replication = store copies for availability and durability**.
@@ -386,6 +421,18 @@ Messaging Service
                    v
           Outbox marked PUBLISHED
 ~~~
+
+```mermaid
+flowchart TD
+  MS["Messaging Service"] --> DB["Database transaction"]
+  DB --> M["Messages: msg-105 COMMITTED"]
+  DB --> O["Outbox: event-105 PENDING"]
+  O --> P["Outbox Publisher Pod"]
+  P --> K["Kafka producer client"]
+  K --> B["Kafka Broker"]
+  B --> ACK["Broker publish ACK"]
+  ACK --> PUB["Outbox marked PUBLISHED"]
+```
 
 - **PENDING → PUBLISHED** means Kafka acknowledged receipt (using the configured producer/broker durability settings); **NOT** that Bob received the message.
 - If publisher crashes **before publishing**, a restarted/other publisher reprocesses the durable pending event.
@@ -447,6 +494,17 @@ Delivery Worker → Redis lookup → Bob's Gateway Pod 2
                                → persist receipt/status → notify Alice
 ~~~
 
+```mermaid
+flowchart TD
+  D["Delivery Worker"] --> R["Redis lookup"]
+  R --> G["Bob's Gateway Pod 2"]
+  G --> W["Existing WebSocket"]
+  W --> B["Bob's app"]
+  B --> A["DELIVERY_ACK"]
+  A --> P["Persist receipt / status"]
+  P --> N["Notify Alice"]
+```
+
 An **ACK from the gateway's socket write is not proof Bob's application received the message**. Bob's application sends a delivery acknowledgment after accepting it. Read receipts are a separate later event.
 
 | State | What it actually means |
@@ -473,6 +531,13 @@ Bob receives:   seq 101 → seq 103 → seq 102
 Bob displays:   seq 101 → seq 102 → seq 103
 ~~~
 
+```mermaid
+flowchart TD
+  A["Alice sends: seq 101 → seq 102 → seq 103"]
+  A --> B["Bob receives: seq 101 → seq 103 → seq 102"]
+  B --> C["Bob displays in order: seq 101 → seq 102 → seq 103"]
+```
+
 The **authoritative conversation sequence** is assigned by the coordinated server/database state, *not* by Alice's timestamp, Bob's timestamp, or the order packets arrive. If Bob expects seq 102 but sees 103, buffer 103 and request seq 102 from history; deduplicate before displaying. Ordering is per conversation, not global.
 
 If Alice and Bob send simultaneously, the authoritative transaction/owner determines which commit gets the earlier sequence. Multiple Messaging Service pods must not allocate conflicting sequence values.
@@ -490,6 +555,15 @@ Messaging Service finds existing committed result
        ↓
 Returns original msg 105, not a second stored message
 ~~~
+
+```mermaid
+flowchart TD
+  A["Alice sends clientMessageId = ABC123"]
+  A --> B["DB commits msg 105; ACK is lost"]
+  B --> C["Alice retries SAME clientMessageId = ABC123"]
+  C --> D["Messaging Service finds existing committed result"]
+  D --> E["Returns original msg 105, not a second stored message"]
+```
 
 The idempotency uniqueness check must be **atomic** so simultaneous retries cannot both insert. Reusing an idempotency key with a different payload should be rejected.
 
@@ -510,6 +584,17 @@ History fetch seq 101, 102, 103...
                  ↓
 Client deduplicates, displays, updates cursor
 ~~~
+
+```mermaid
+flowchart TD
+  A["Bob offline: no live Redis entry"]
+  A --> B["Message stays in durable DB"]
+  B --> C["Optional APNs / FCM push notification: not source of truth"]
+  C --> D["Bob reconnects / authenticates"]
+  D --> E["Bob reports last contiguous sequence = 100"]
+  E --> F["History fetch: seq 101, 102, 103..."]
+  F --> G["Client deduplicates, displays, updates cursor"]
+```
 
 A newly connected client should reconcile the race between history retrieval and incoming live messages (subscribe/fence a watermark, catch up, merge by sequence). Two devices may hold different sync cursors.
 
@@ -565,6 +650,14 @@ US-WEST-2 (3 AZ, warm standby)
   Ready gateway/services/broker + replicated DB state
 ~~~
 
+```mermaid
+flowchart TD
+  E["US-EAST-1: 3 AZ, active"]
+  E1["WebSocket / Messaging / Outbox / Kafka / DB writer"] --- E
+  E -->|"Cross-region replication"| W["US-WEST-2: 3 AZ, warm standby"]
+  W --- W1["Ready gateway / services / broker and replicated DB state"]
+```
+
 - Warm standby is **not automatically full spare capacity**. Verify quotas, image pull readiness, DB/broker capability and scale-up time.
 - Failover: establish impact and replica watermark → **fence old writer** → promote/assign exclusive ownership in West → route new client connections → clients reconnect/authenticate/sync → replay and verify.
 - Example: East acknowledged through **105**, West holds only **103**. Asynchronous replication can lose 104–105 after permanent East loss.
@@ -615,6 +708,25 @@ BOB RECEIVES
     Bob app sends DELIVERY_ACK → update receipt → notify Alice
 ~~~
 
+```mermaid
+flowchart TD
+  A["1. Alice opens app: DNS resolves messaging.example.com"]
+  A --> B["2. DNS / global routing → NLB → healthy region and gateway"]
+  B --> C["3. WebSocket Gateway Pod 1: authenticated persistent WSS connection"]
+  C --> D["Alice sends over EXISTING socket"]
+  D --> E["4. Messaging Service Pod: authorization, validation, clientMessageId"]
+  E --> F["5. Database ATOMIC COMMIT: message, idempotency, sequence state, outbox"]
+  F --> ACK["ACCEPTED ACK to Alice: stored, NOT Bob-delivered"]
+  F --> G["6. Outbox Publisher reads PENDING event"]
+  G --> H["7. Kafka Producer → Kafka Broker: publish ACK"]
+  H --> I["Outbox marked PUBLISHED"]
+  I --> J["8. Delivery Worker consumes Kafka event"]
+  J --> K["9. Redis lookup: Bob/device → Gateway Pod 2 or Bob offline"]
+  K --> L["10. Gateway Pod 2 pushes over Bob's existing WebSocket"]
+  L --> M["Bob app sends DELIVERY_ACK"]
+  M --> N["Update receipt and notify Alice"]
+```
+
 ~~~text
 Alice
   |
@@ -647,6 +759,28 @@ DELIVERY_ACK
   |
 Update DB → Notify Alice
 ~~~
+
+```mermaid
+flowchart TD
+  A["Alice"] --> D["DNS"] --> N["NLB"]
+  N --> W1["WebSocket Gateway Pod 1"]
+  W1 --> M["Messaging Service Pod"]
+  M --> TX["Database: Atomic Transaction"]
+  TX --> MSG["Messages"]
+  TX --> IDEM["Idempotency / Sequence"]
+  TX --> OB["Outbox"]
+  TX --> ACK["ACCEPTED ACK to Alice"]
+  OB --> PUB["Outbox Publisher Pod"]
+  PUB --> KP["Kafka Producer"]
+  KP --> K["Kafka"]
+  K --> DW["Delivery Worker: Consumer"]
+  DW --> R["Redis Lookup"]
+  R --> W2["WebSocket Gateway Pod 2"]
+  W2 --> B["Bob's Mobile"]
+  B --> DA["DELIVERY_ACK"]
+  DA --> U["Update DB"]
+  U --> NA["Notify Alice"]
+```
 
 ~~~text
 Kafka
@@ -681,6 +815,18 @@ Messaging Service
   v
 Database (Update delivery status)
 ~~~
+
+```mermaid
+flowchart TD
+  K["Kafka"] --> D["Delivery Worker Pod"]
+  D -->|"1. Look up Bob"| R["Redis"]
+  R -->|"2. Bob is connected to"| G["WebSocket Gateway Pod 2"]
+  D -->|"3. Forward message to Pod 2"| G
+  G -->|"4. Send over existing WebSocket"| B["Bob's Mobile App"]
+  B -->|"5. DELIVERY_ACK"| G
+  G --> M["Messaging Service"]
+  M --> DB["Database: update delivery status"]
+```
 
 
 
@@ -732,6 +878,21 @@ DB has accepted message + outbox event PENDING
    Kafka returns → publisher retries → consumer → Bob
 ~~~
 
+```mermaid
+flowchart TD
+  A["DB has accepted message and outbox event PENDING"]
+  A --> B["Kafka unavailable"]
+  B --> C["Outbox Publisher cannot complete publication"]
+  C --> D["Alice still has ACCEPTED: durable DB commit"]
+  D --> E["Bob's real-time delivery may be delayed"]
+  E --> F["Monitor oldest outbox age, backlog, DB capacity"]
+  F --> G["Rate-limit only at unsafe backlog / capacity threshold"]
+  G --> H["Kafka returns"]
+  H --> I["Publisher retries"]
+  I --> J["Consumer"]
+  J --> K["Bob receives"]
+```
+
 **Regional outage deeper flow (second scenario rehearsed):**
 
 ~~~text
@@ -742,6 +903,17 @@ East Region DOWN → identify last safe West replication watermark
        → Alice and Bob re-establish WebSocket sessions
        → replay/reconcile messages, verify sequence and receipts
 ~~~
+
+```mermaid
+flowchart TD
+  A["East Region DOWN"]
+  A --> B["Identify last safe West replication watermark"]
+  B --> C["Fence / retire East ownership before write promotion"]
+  C --> D["Activate West services / DB writer after consistency check"]
+  D --> E["Global routing sends new connections to West"]
+  E --> F["Alice and Bob re-establish WebSocket sessions"]
+  F --> G["Replay / reconcile messages; verify sequence and receipts"]
+```
 
 ---
 
