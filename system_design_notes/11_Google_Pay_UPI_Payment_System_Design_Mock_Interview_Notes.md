@@ -276,7 +276,7 @@ Also store request fingerprint, attempts, timestamps, original participant/netwo
 
 ### End-to-end transfer sequence (conceptual)
 
-~~~mermaid
+```mermaid
 sequenceDiagram
   autonumber
   participant Alice as Alice App
@@ -290,7 +290,7 @@ sequenceDiagram
   Alice->>API: Send INR 1,000
   API->>DB: Atomic payment + outbox commit
   DB-->>API: Committed
-  API-->>Alice: payment_id; PROCESSING
+  API-->>Alice: Payment ID and PROCESSING status
   Worker->>DB: Claim durable dispatch intent
   Worker->>PSP: Authorized instruction + original refs
   PSP->>NPCI: Route payment
@@ -301,7 +301,7 @@ sequenceDiagram
   NPCI-->>PSP: Transaction result
   PSP-->>API: Trusted result / status
   API->>DB: Persist verified state
-~~~
+```
 
 The message sequence is illustrative; PIN authorization and bank settlement have participant-specific details.
 
